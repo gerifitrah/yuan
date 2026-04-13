@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ':*)",
+      "Bash(python -c \"import tensorflow as tf; print\\('TF:', tf.__version__\\)\")",
+      "Bash(python -c \"import torch; print\\('PyTorch:', torch.__version__\\)\")",
+      "Bash(python -c \"import streamlit as st; print\\('Streamlit:', st.__version__\\)\")",
+      "Bash(python -c \"import sklearn; print\\('sklearn:', sklearn.__version__\\)\")",
+      "Bash(python -c \"import pandas as pd; print\\('pandas:', pd.__version__\\)\")",
+      "Bash(python model.py)",
+      "Bash(python preprocess.py)",
+      "Bash(python -c \"import train; import evaluate; print\\('all imports OK'\\)\")"
+    ]
+  }
+}
