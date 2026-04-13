@@ -234,32 +234,106 @@ def page_forecast(df: pd.DataFrame, model: Seq2SeqQuantile | None, q_scaler):
         st.error("Scalers not found. Re-train the model.")
         return
 
+    # ------------------------------------------------------------------
+    # Date picker — any date, including future (beyond dataset)
+    # ------------------------------------------------------------------
+    import calendar
+    data_end   = df["date"].max()
+    data_start = df["date"].min() + pd.Timedelta(days=ENC_LEN)
+
     st.markdown(
-        "Provide the **last 30 days** of observed data (auto-filled from the dataset) "
-        "and the **next 7 days** of rainfall forecast."
+        "Pilih **tanggal mulai forecast** — bisa tanggal historis (dalam dataset) "
+        "maupun tanggal masa depan (2025, 2026, dst)."
     )
 
-    # ------------------------------------------------------------------
-    # Auto-fill look-back from the most recent 30 days in the CSV
-    # ------------------------------------------------------------------
-    recent = df.tail(ENC_LEN).reset_index(drop=True)
+    col_y, col_m, col_d = st.columns(3)
+    # Allow years up to current year + 5 for future forecasting
+    years  = list(range(data_start.year, pd.Timestamp.now().year + 6))
+    months = list(range(1, 13))
 
-    st.subheader("Look-back window (last 30 days — editable)")
-    look_back_df = recent[["date", "p_das", "q_total"]].copy()
+    # Default to today or dataset end, whichever is later
+    default_ref = max(pd.Timestamp.now().normalize(), data_end + pd.Timedelta(days=1))
+    default_year_idx  = years.index(default_ref.year) if default_ref.year in years else len(years) - 1
+
+    sel_year  = col_y.selectbox("Tahun", years, index=default_year_idx)
+    sel_month = col_m.selectbox(
+        "Bulan", months,
+        index=default_ref.month - 1,
+        format_func=lambda m: pd.Timestamp(2000, m, 1).strftime("%B"),
+    )
+
+    max_day     = calendar.monthrange(sel_year, sel_month)[1]
+    default_day = min(default_ref.day, max_day)
+    sel_day = col_d.selectbox("Hari", list(range(1, max_day + 1)), index=default_day - 1)
+
+    try:
+        ref_date = pd.Timestamp(sel_year, sel_month, sel_day)
+    except Exception:
+        st.error("Tanggal tidak valid.")
+        return
+
+    # Enforce minimum (need ENC_LEN days of look-back in dataset)
+    if ref_date < data_start:
+        st.error(f"Tanggal minimal adalah {data_start.date()} (butuh 30 hari look-back dari dataset).")
+        return
+
+    is_future   = ref_date > data_end          # forecast start is beyond dataset
+    has_actuals = (ref_date + pd.Timedelta(days=PRED_LEN - 1)) <= data_end  # actuals available
+
+    # Info banner
+    if is_future:
+        st.info(
+            f"Tanggal **{ref_date.date()}** berada di luar dataset (dataset berakhir {data_end.date()}). "
+            f"Look-back otomatis menggunakan 30 hari terakhir dataset. "
+            f"Input curah hujan forecast secara manual."
+        )
+    else:
+        st.caption(
+            f"Forecast: **{ref_date.date()}** s.d. **{(ref_date + pd.Timedelta(days=PRED_LEN-1)).date()}** | "
+            f"Look-back: {(ref_date - pd.Timedelta(days=ENC_LEN)).date()} s.d. {(ref_date - pd.Timedelta(days=1)).date()}"
+        )
+
+    # ------------------------------------------------------------------
+    # Look-back window
+    # ------------------------------------------------------------------
+    if is_future:
+        # Use last 30 days of dataset
+        lb_end = df.tail(ENC_LEN).reset_index(drop=True)
+    else:
+        lb_end = df[df["date"] < ref_date].tail(ENC_LEN).reset_index(drop=True)
+
+    if len(lb_end) < ENC_LEN:
+        st.error(f"Data look-back tidak cukup (hanya {len(lb_end)} hari tersedia, butuh {ENC_LEN}).")
+        return
+
+    st.subheader("Look-back window (30 hari sebelum tanggal referensi — bisa diedit)")
+    look_back_df = lb_end[["date", "p_das", "q_total"]].copy()
     look_back_df["date"] = look_back_df["date"].dt.strftime("%Y-%m-%d")
     edited_lb = st.data_editor(look_back_df, use_container_width=True, num_rows="fixed")
 
     # ------------------------------------------------------------------
-    # 7-day rainfall forecast input
+    # Forecast input — auto-fill from dataset if available, else 0
     # ------------------------------------------------------------------
-    st.subheader("Rainfall forecast — next 7 days")
-    last_date = df["date"].max()
-    forecast_dates = [last_date + pd.Timedelta(days=i + 1) for i in range(PRED_LEN)]
-    forecast_df = pd.DataFrame({
-        "date": [d.strftime("%Y-%m-%d") for d in forecast_dates],
-        "p_das_forecast_mm": [0.0] * PRED_LEN,
-    })
+    st.subheader("Curah Hujan Forecast — 7 hari ke depan")
+    forecast_dates = [ref_date + pd.Timedelta(days=i) for i in range(PRED_LEN)]
+
+    # Pre-fill P_DAS from dataset if available, else 0 (user inputs manually)
+    fc_rows  = []
+    actual_q = []
+    for fd in forecast_dates:
+        row   = df[df["date"] == fd]
+        p_val = float(row["p_das"].values[0])   if len(row) else 0.0
+        q_val = float(row["q_total"].values[0]) if len(row) else None
+        fc_rows.append({"Tanggal": fd.strftime("%Y-%m-%d"), "P_DAS forecast (mm)": p_val})
+        actual_q.append(q_val)
+
+    forecast_df = pd.DataFrame(fc_rows)
     edited_fc = st.data_editor(forecast_df, use_container_width=True, num_rows="fixed")
+
+    if is_future:
+        st.caption("Masukkan perkiraan curah hujan harian (mm) untuk 7 hari ke depan secara manual.")
+    elif has_actuals:
+        st.info("P_DAS otomatis diisi dari data historis. Setelah prediksi, debit aktual ditampilkan sebagai pembanding.")
 
     # ------------------------------------------------------------------
     # Run prediction
@@ -268,7 +342,7 @@ def page_forecast(df: pd.DataFrame, model: Seq2SeqQuantile | None, q_scaler):
         try:
             p_hist = edited_lb["p_das"].astype(float).values
             q_hist = edited_lb["q_total"].astype(float).values
-            p_fore = edited_fc["p_das_forecast_mm"].astype(float).values
+            p_fore = edited_fc["P_DAS forecast (mm)"].astype(float).values
 
             if len(p_hist) != ENC_LEN or len(p_fore) != PRED_LEN:
                 st.error(f"Need exactly {ENC_LEN} look-back rows and {PRED_LEN} forecast rows.")
@@ -277,14 +351,14 @@ def page_forecast(df: pd.DataFrame, model: Seq2SeqQuantile | None, q_scaler):
             preds = predict(model, p_hist, q_hist, p_fore, q_scaler)
             # preds: (7, 3) — [q10, q50, q90]
 
-            _show_forecast_results(preds, forecast_dates, p_fore)
+            _show_forecast_results(preds, forecast_dates, p_fore, actual_q)
 
         except Exception as e:
             st.error(f"Prediction failed: {e}")
             raise
 
 
-def _show_forecast_results(preds: np.ndarray, dates, p_fore: np.ndarray):
+def _show_forecast_results(preds: np.ndarray, dates, p_fore: np.ndarray, actual_q=None):
     """Render the forecast chart and summary table."""
     date_strs = [d.strftime("%Y-%m-%d") for d in dates]
 
@@ -331,11 +405,21 @@ def _show_forecast_results(preds: np.ndarray, dates, p_fore: np.ndarray):
         marker_color="rgba(31,119,180,0.35)",
     ))
 
+    # Actual observed Q (if available from historical data)
+    if actual_q and any(v is not None for v in actual_q):
+        actual_vals = [v if v is not None else None for v in actual_q]
+        fig.add_trace(go.Scatter(
+            x=date_strs, y=actual_vals,
+            mode="lines+markers", name="Aktual (observed)",
+            line=dict(color="black", width=2, dash="dash"),
+            marker=dict(size=8, symbol="circle-open"),
+        ))
+
     fig.update_layout(
         title="7-Day Inflow Forecast — PLTA Grindulu",
-        xaxis_title="Date",
+        xaxis_title="Tanggal",
         yaxis=dict(title="Inflow Q (m³/s)", rangemode="tozero"),
-        yaxis2=dict(title="Rainfall (mm)", overlaying="y", side="right", autorange="reversed"),
+        yaxis2=dict(title="Curah Hujan (mm)", overlaying="y", side="right", autorange="reversed"),
         legend=dict(orientation="h", y=-0.2),
         height=460,
         margin=dict(l=0, r=0, t=40, b=0),
@@ -345,20 +429,39 @@ def _show_forecast_results(preds: np.ndarray, dates, p_fore: np.ndarray):
     # ------------------------------------------------------------------
     # Summary table
     # ------------------------------------------------------------------
+    actual_col = [f"{v:.3f}" if v is not None else "—"
+                  for v in (actual_q or [None] * len(date_strs))]
+
     result_df = pd.DataFrame({
-        "Date":           date_strs,
-        "P_DAS (mm)":     p_fore.round(1),
-        "Q10 — Dry (m³/s)":    preds[:, 0].round(3),
-        "Q50 — Normal (m³/s)": preds[:, 1].round(3),
-        "Q90 — Wet (m³/s)":    preds[:, 2].round(3),
+        "Tanggal":              date_strs,
+        "P_DAS (mm)":           p_fore.round(1),
+        "Q10 — Kering (m³/s)":  preds[:, 0].round(3),
+        "Q50 — Normal (m³/s)":  preds[:, 1].round(3),
+        "Q90 — Basah (m³/s)":   preds[:, 2].round(3),
+        "Aktual (m³/s)":        actual_col,
     })
-    st.subheader("Forecast Table")
+    st.subheader("Tabel Prediksi")
     st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+    # Error metrics if actuals available
+    if actual_q and any(v is not None for v in actual_q):
+        obs_arr  = np.array([v for v in actual_q if v is not None], dtype=float)
+        q50_arr  = preds[[i for i, v in enumerate(actual_q) if v is not None], 1]
+        mae  = float(np.mean(np.abs(obs_arr - q50_arr)))
+        rmse = float(np.sqrt(np.mean((obs_arr - q50_arr) ** 2)))
+        c1, c2, c3 = st.columns(3)
+        c1.metric("MAE vs Aktual",  f"{mae:.3f} m³/s")
+        c2.metric("RMSE vs Aktual", f"{rmse:.3f} m³/s")
+        covered = np.sum(
+            (obs_arr >= preds[[i for i, v in enumerate(actual_q) if v is not None], 0]) &
+            (obs_arr <= preds[[i for i, v in enumerate(actual_q) if v is not None], 2])
+        )
+        c3.metric("Aktual dalam [Q10,Q90]", f"{covered}/{len(obs_arr)} hari")
 
     # Download button
     csv = result_df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="⬇ Download forecast CSV",
+        label="Download forecast CSV",
         data=csv,
         file_name="grindulu_forecast.csv",
         mime="text/csv",
