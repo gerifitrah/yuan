@@ -36,16 +36,33 @@ from torch.utils.data import DataLoader, TensorDataset
 # Constants
 # ---------------------------------------------------------------------------
 
-ENC_LEN   = 30   # look-back window
-PRED_LEN  = 7    # forecast horizon
+ENC_LEN    = 30   # look-back window
+PRED_LEN   = 7    # forecast horizon
 BATCH_SIZE = 32
 
 TRAIN_FRAC = 0.70
 VAL_FRAC   = 0.15
 # Test fraction = 1 - TRAIN_FRAC - VAL_FRAC = 0.15
 
-DATA_PATH       = os.path.join(os.path.dirname(__file__), "data_grindulu.csv")
-SAVE_DIR        = os.path.join(os.path.dirname(__file__), "saved_model")
+# ---------------------------------------------------------------------------
+# Dataset switch — change DATASET here to swap everything at once
+#
+#   "v1" : data_grindulu.csv      (original, constant baseflow)  → saved_model/
+#   "v2" : data_grindulu_raw.csv  (raw PDF, dynamic baseflow)    → saved_model_v2/
+# ---------------------------------------------------------------------------
+
+DATASET = "v1"
+
+_BASE = os.path.dirname(__file__)
+
+if DATASET == "v1":
+    DATA_PATH = os.path.join(_BASE, "data_grindulu.csv")
+    SAVE_DIR  = os.path.join(_BASE, "saved_model")
+elif DATASET == "v2":
+    DATA_PATH = os.path.join(_BASE, "data_grindulu_raw.csv")
+    SAVE_DIR  = os.path.join(_BASE, "saved_model_v2")
+else:
+    raise ValueError(f"Unknown DATASET '{DATASET}'. Choose 'v1' or 'v2'.")
 
 
 # ---------------------------------------------------------------------------

@@ -23,13 +23,11 @@ import pandas as pd
 import torch
 
 from model import Seq2SeqQuantile
-from preprocess import ENC_LEN, PRED_LEN, SAVE_DIR
+from preprocess import DATA_PATH, ENC_LEN, PRED_LEN, SAVE_DIR
 
-SAVE_DIR      = os.path.join(os.path.dirname(__file__), "saved_model")
 MODEL_PATH    = os.path.join(SAVE_DIR, "best_model.pt")
 SCALER_PATH   = os.path.join(SAVE_DIR, "feature_scaler.pkl")
 Q_SCALER_PATH = os.path.join(SAVE_DIR, "q_scaler.pkl")
-DATA_PATH     = os.path.join(os.path.dirname(__file__), "data_grindulu.csv")
 
 
 def load_monthly_avg_p_das(df: pd.DataFrame) -> dict:

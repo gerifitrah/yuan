@@ -1,9 +1,11 @@
 # PLTA Grindulu — Bi-LSTM Seq2Seq Inflow Prediction
 
-Sistem prediksi debit inflow harian untuk PLTA Grindulu (Pumped Storage, 1000 MW)
-di DAS Grindulu, Pacitan, Jawa Timur.
+Sistem prediksi debit inflow harian untuk **PLTA Grindulu (Pumped Storage, 1000 MW)**
+di DAS Grindulu, Pacitan, Jawa Timur menggunakan model **Bi-LSTM Seq2Seq Quantile Regression**.
+
 Karena PLTA ini belum dibangun (*greenfield*), debit inflow tidak diukur langsung —
-melainkan dihitung dari data curah hujan historis menggunakan metode SCS Curve Number.
+melainkan direkonstruksi dari data curah hujan historis menggunakan pipeline hidrologi
+SCS Curve Number + Linear Reservoir Routing.
 
 ---
 
@@ -11,240 +13,198 @@ melainkan dihitung dari data curah hujan historis menggunakan metode SCS Curve N
 
 ```
 new version/
-├── data_grindulu.csv      ← Dataset utama (4.018 hari, 2014–2024)
-├── model.py               ← Arsitektur Bi-LSTM Seq2Seq (PyTorch)
-├── preprocess.py          ← Load data, normalisasi, buat sequence
-├── train.py               ← Training loop (Pinball Loss)
-├── evaluate.py            ← Metrik probabilistik (CRPS, PICP, PINAW)
-├── charts.py              ← Semua fungsi chart (Plotly)
-├── app.py                 ← Streamlit dashboard
+├── data_grindulu.csv          ← Dataset v1 (baseflow konstan, dari PERHITUNGAN.xlsx)
+├── data_grindulu_raw.csv      ← Dataset v2 (baseflow dinamis, dari raw PDF langsung)
+├── PERHITUNGAN.xlsx           ← Workbook Excel sumber (QC + SCS-CN pipeline)
+├── raw data/                  ← PDF data hujan harian dari BBWS / Hidrologi PUPR
+│   ├── Pos Curah Hujan Pacitan - Pacitan 2014 - 2024.pdf
+│   ├── Pos Curah Hujan Nawangan Grindulu - Pacitan 2014 - 2024.pdf
+│   ├── Curah Hujan Kebongagung - Pacitan 2014 - 2024.pdf
+│   ├── DATA CURAH HUJAN Bandar.pdf
+│   ├── DATA CURAH HUJAN Tegalombo.pdf
+│   └── DATA CURAH HUJAN Tulakan.pdf
+├── referansi/
+│   ├── PENELITIAN.pdf         ← Metodologi penelitian
+│   └── Tugas Paper_Kelompok 2_Rafsanjani_Arham.pdf  ← Referensi model Poso PLTA
+├── build_raw_dataset.py       ← Build data_grindulu_raw.csv dari raw PDF
+├── model.py                   ← Arsitektur Bi-LSTM Seq2Seq (PyTorch)
+├── preprocess.py              ← Load data, normalisasi, buat sequence
+├── train.py                   ← Training loop (Pinball Loss + early stopping)
+├── evaluate.py                ← Metrik probabilistik (CRPS, PICP, PINAW)
+├── annual_forecast.py         ← Rolling forecast 365 hari
+├── charts.py                  ← Semua fungsi chart (Plotly)
+├── app.py                     ← Streamlit dashboard (5 tab)
 ├── requirements.txt
 └── saved_model/
-    ├── best_model.pt      ← Model terbaik (val loss terendah)
-    ├── feature_scaler.pkl ← MinMaxScaler untuk input fitur
-    ├── q_scaler.pkl       ← MinMaxScaler untuk q_total
-    └── train_history.csv  ← Loss per epoch
+    ├── best_model.pt          ← Model terbaik (val loss terendah)
+    ├── feature_scaler.pkl     ← MinMaxScaler untuk fitur input
+    ├── q_scaler.pkl           ← MinMaxScaler untuk q_total
+    └── train_history.csv      ← Loss per epoch
 ```
 
 ---
 
-## Dataset: `data_grindulu.csv`
+## Dataset
 
-**Periode:** 1 Januari 2014 – 31 Desember 2024  
-**Jumlah baris:** 4.018 hari  
-**Jumlah kolom:** 12
+### v1 — `data_grindulu.csv` (original)
 
-### Penjelasan Setiap Kolom
+Diekspor dari `PERHITUNGAN.xlsx`, menggunakan **baseflow konstan**.
 
----
-
-#### `date`
-Tanggal pengamatan dalam format `YYYY-MM-DD`.
-- Rentang: 2014-01-01 s.d. 2024-12-31
-- Frekuensi: harian (tidak ada tanggal yang hilang)
+| Info | Nilai |
+|------|-------|
+| Periode | 1 Jan 2014 – 31 Des 2024 |
+| Jumlah baris | 4.018 hari |
+| Q_baseflow | konstan = 3.929 m³/s |
+| Hari turbin bisa beroperasi (Q ≥ 18.15 m³/s) | 324 hari (8.1%) |
 
 ---
 
-#### `pacitan`, `nawangan`, `kebonagung`, `bandar`, `tegalombo`, `tulakan`
-**Curah hujan harian (mm) di masing-masing stasiun penakar hujan** dalam DAS Grindulu.
+### v2 — `data_grindulu_raw.csv` (improved)
 
-| Kolom | Nama Stasiun | Elevasi | Operasi |
-|-------|-------------|---------|---------|
-| `pacitan` | Stasiun Pacitan | — | 2014–2024 |
-| `nawangan` | Stasiun Nawangan | — | 2014–2024 |
-| `kebonagung` | Stasiun Kebon Agung | — | 2014–2024 |
-| `bandar` | Stasiun Bandar | 957 m | 2014–2024 |
-| `tegalombo` | Stasiun Tegalombo | 200 m | 2014–2024 |
-| `tulakan` | Stasiun Tulakan | 350 m | 2014–2024 |
+Dibangun langsung dari 6 PDF raw, menggunakan **dynamic baseflow (linear reservoir routing)**.
+Mengimplementasikan *Routing hidrologi* sesuai metodologi penelitian (PENELITIAN.pdf, 3.4.2.c).
 
-> **Satuan:** mm/hari  
-> **Nilai 0:** tidak ada hujan pada hari tersebut  
-> **Sumber:** BBWS Bengawan Solo (data PDF per stasiun)
+| Info | Nilai |
+|------|-------|
+| Periode | 1 Jan 2014 – 31 Des 2024 |
+| Jumlah baris | 4.018 hari |
+| Q_baseflow | dinamis, rata-rata 11.1 m³/s (seasonal) |
+| Hari turbin bisa beroperasi (Q ≥ 18.15 m³/s) | 833 hari (20.7%) |
 
-Statistik ringkas:
+Untuk meregenerasi file ini dari PDF raw:
 
-| Stasiun | Rata-rata | Maks | Catatan kualitas data |
-|---------|-----------|------|-----------------------|
-| pacitan | 6.35 mm | 245 mm | — |
-| nawangan | 7.32 mm | 195 mm | Apr 2018: 1 hari data invalid |
-| kebonagung | 8.40 mm | 304 mm | Nov 2017: 2 hari diduga salah baca 10× |
-| bandar | 7.10 mm | 206 mm | Okt–Nov 2022: ~8 hari kosong |
-| tegalombo | 5.89 mm | 189 mm | Mei–Des 2015: 8 bulan semua nol (alat rusak) |
-| tulakan | 7.23 mm | 293 mm | 2017 Jan & 2020: total ~47 hari kosong |
+```bash
+python build_raw_dataset.py
+```
 
 ---
 
-#### `p_das`
-**Curah hujan wilayah DAS (mm/hari)** — rata-rata aritmatika dari 6 stasiun.
+### Penjelasan Kolom
 
-```
-P_DAS = (Pacitan + Nawangan + Kebonagung + Bandar + Tegalombo + Tulakan) / 6
-```
-
-> Meskipun sheet Excel bernama "Thiessen Polygon", perhitungan aktual menggunakan
-> **rata-rata aritmatika** (bobot seragam = 1/6 untuk setiap stasiun).
-
-| Statistik | Nilai |
-|-----------|-------|
-| Rata-rata | 7.05 mm/hari |
-| Nilai maks | 138.83 mm (28 Nov 2017) |
-| Nilai min | 0.00 mm |
-| Hari dengan hujan (P_DAS > 0) | 2.695 hari (67.1%) |
+| Kolom | Satuan | Deskripsi |
+|-------|--------|-----------|
+| `date` | — | Tanggal (YYYY-MM-DD), harian tanpa gap |
+| `pacitan` | mm/hari | Curah hujan Stasiun Pacitan |
+| `nawangan` | mm/hari | Curah hujan Stasiun Nawangan |
+| `kebonagung` | mm/hari | Curah hujan Stasiun Kebon Agung |
+| `bandar` | mm/hari | Curah hujan Stasiun Bandar (elv. 957 m) |
+| `tegalombo` | mm/hari | Curah hujan Stasiun Tegalombo (elv. 200 m) |
+| `tulakan` | mm/hari | Curah hujan Stasiun Tulakan (elv. 350 m) |
+| `p_das` | mm/hari | Rata-rata aritmatika 6 stasiun |
+| `pe` | mm/hari | Curah hujan efektif SCS-CN |
+| `q_runoff` | m³/s | Debit limpasan permukaan |
+| `q_baseflow` | m³/s | Debit aliran dasar (konstan v1 / dinamis v2) |
+| `q_total` | m³/s | **Target prediksi** = q_runoff + q_baseflow |
 
 ---
 
-#### `pe`
-**Curah hujan efektif (mm/hari)** — bagian dari curah hujan yang menjadi limpasan permukaan,
-dihitung menggunakan metode **SCS Curve Number (CN)**.
+## Pipeline Hidrologi
 
-**Formula:**
+### v1 — Baseflow Konstan
 
 ```
-S  = (25400 / CN) - 254        → S  = 63.5 mm  (dengan CN = 80)
-Ia = 0.2 × S                   → Ia = 12.7 mm  (abstraksi awal)
-
-Jika P_DAS > Ia:
-    Pe = (P_DAS - Ia)² / (P_DAS - Ia + S)
-Jika P_DAS ≤ Ia:
-    Pe = 0
+Hujan 6 Stasiun
+      ↓  rata-rata aritmatika
+  P_DAS (mm/hari)
+      ↓  SCS-CN  [CN=80, S=63.5mm, Ia=12.7mm]
+    Pe (mm/hari)
+      ↓  × 700 km² × 1000 / 86400
+  Q_runoff (m³/s)
+      ↓  + 3.929 (konstan)
+  Q_total (m³/s)  ← TARGET
 ```
 
-**Parameter DAS Grindulu:**
+### v2 — Dynamic Baseflow (Linear Reservoir Routing)
+
+```
+Hujan 6 Stasiun
+      ↓  rata-rata aritmatika
+  P_DAS (mm/hari)
+      ↓  SCS-CN  [CN=80, S=63.5mm, Ia=12.7mm]
+    Pe (mm/hari)
+      ↓  × 700 km² × 1000 / 86400
+  Q_runoff (m³/s)
+      ↓  linear reservoir routing
+  Q_baseflow(t) = max(Q_min,  K × Q_base(t-1)  +  α × Q_runoff(t))
+      ↓  +
+  Q_total (m³/s)  ← TARGET
+```
+
+**Parameter routing (tipikal DAS tropis Jawa, berbasis literatur):**
 
 | Parameter | Nilai | Keterangan |
 |-----------|-------|-----------|
-| CN | 80 | Tata guna lahan campuran (hutan + pertanian) |
-| S | 63.5 mm | Retensi potensial maksimum |
-| Ia | 12.7 mm | Abstraksi awal (kehilangan sebelum limpasan mulai) |
+| K | 0.92 | Koefisien resesi; aliran dasar turun setengahnya dalam ~8 hari tanpa hujan |
+| α | 0.15 | Fraksi recharge; 15% Q_runoff masuk ke groundwater |
+| Q_min | 3.929 m³/s | Batas minimum fisik (sama dengan estimasi original) |
 
-> Artinya: hujan baru mulai menghasilkan limpasan setelah melebihi **12.7 mm**.
-> Itulah mengapa banyak hari bernilai Pe = 0 meskipun ada hujan kecil.
-
-| Statistik | Nilai |
-|-----------|-------|
-| Rata-rata | 0.63 mm/hari |
-| Nilai maks | 83.90 mm |
-| Hari dengan Pe > 0 | 784 hari (19.5%) |
+**Untuk paper:**
+> *"Routing hidrologi dilakukan menggunakan model linear reservoir:*
+> *Q_base(t) = max(Q_min, K · Q_base(t−1) + α · Q_runoff(t))*
+> *dengan K = 0,92, α = 0,15, dan Q_min = 3,929 m³/s."*
 
 ---
 
-#### `q_runoff`
-**Debit limpasan permukaan (m³/s)** — konversi dari volume limpasan SCS-CN ke debit harian.
+## SCS-CN Parameters
 
-**Formula:**
-
-```
-Luas DAS  = 700 km² = 700 × 10⁶ m²
-Volume    = Pe (m) × Luas DAS (m²)           [dalam m³]
-Q_runoff  = Volume / 86.400                  [dibagi detik dalam 1 hari]
-          = (Pe / 1000) × 700×10⁶ / 86400
-```
-
-> **Asumsi:** limpasan tersebar merata selama 24 jam penuh.
-> Ini adalah penyederhanaan untuk skala feasibility study.
-
-| Statistik | Nilai |
-|-----------|-------|
-| Rata-rata | 5.11 m³/s |
-| Nilai maks | 679.72 m³/s |
-| Hari dengan Q_runoff > 0 | 784 hari (19.5%) |
+| Parameter | Nilai | Sumber |
+|-----------|-------|--------|
+| CN | 80 | Tata guna lahan campuran (hutan 2.7% + sawah 17.3% + tegalan 40.7% + pemukiman 39.3%) |
+| S | 63.5 mm | (25400/CN) − 254 |
+| Ia | 12.7 mm | 0.2 × S (abstraksi awal) |
+| Luas DAS | 700 km² | Delineasi GIS dari DEM |
 
 ---
 
-#### `q_baseflow`
-**Debit aliran dasar / baseflow (m³/s)** — aliran sungai minimum yang berasal dari
-air tanah (groundwater), bukan dari hujan langsung.
+## Arsitektur Model
 
 ```
-Q_baseflow = konstan = 3.9292 m³/s  (untuk semua hari)
+Encoder Input   : 30 hari × [P_DAS, Q_total]
+                        ↓
+             Bi-LSTM Encoder
+             hidden=128, layers=2
+             (baca maju + mundur)
+                        ↓
+             Proyeksi state → Decoder
+                        ↓
+Decoder Input   : 7 hari × [P_DAS_forecast]
+                        ↓
+             LSTM Decoder
+             hidden=128, layers=2
+                        ↓
+Output          : 7 hari × [Q10, Q50, Q90]
 ```
 
-> Nilai konstan ini diambil dari analisis debit minimum historis DAS Grindulu.
-> Pada hari kering (tidak ada hujan / limpasan = 0), sungai tetap mengalir
-> dengan debit dasar ini.
-
----
-
-#### `q_total`
-**Debit total (m³/s)** — variabel TARGET model prediksi.
-
-```
-Q_total = Q_runoff + Q_baseflow
-```
-
-Ini merepresentasikan **total debit inflow ke reservoir PLTA Grindulu** setiap hari.
-
-| Statistik | Nilai |
-|-----------|-------|
-| Rata-rata | 9.04 m³/s |
-| Nilai maks | 683.65 m³/s (28 Nov 2017) |
-| Nilai min | 3.93 m³/s (hari kering, baseflow saja) |
-| Hari dengan Q_total = baseflow (kering) | 3.234 hari (80.5%) |
-
-> **Catatan:** 80.5% hari memiliki Q_total = Q_baseflow = 3.93 m³/s karena
-> tidak ada limpasan (P_DAS ≤ Ia = 12.7 mm). Distribusi ini **sangat right-skewed**
-> (ekor panjang ke kanan) — kondisi normal adalah kering, banjir adalah outlier.
-
----
-
-### Ringkasan Alur Perhitungan Data
-
-```
-Hujan Stasiun (6 titik)
-        ↓  rata-rata aritmatika
-    P_DAS (mm/hari)
-        ↓  SCS-CN  [CN=80, S=63.5mm, Ia=12.7mm]
-      Pe (mm/hari)  ← hujan efektif
-        ↓  × Luas DAS / 86400
-   Q_runoff (m³/s)
-        ↓  + baseflow konstan
-   Q_total (m³/s)  ← TARGET PREDIKSI
-```
-
----
-
-## Model Arsitektur
-
-```
-Input (Encoder)         30 hari ke belakang:  [P_DAS, Q_total]
-                                 ↓
-                    Bi-LSTM Encoder (128 hidden, 2 layer)
-                    membaca urutan maju DAN mundur
-                                 ↓
-                    Proyeksi hidden state → Decoder
-                                 ↓
-Input (Decoder)          7 hari ke depan:  [P_DAS_forecast]
-                                 ↓
-                    LSTM Decoder (128 hidden, 2 layer)
-                    step-by-step untuk setiap hari
-                                 ↓
-Output               [Q10, Q50, Q90] × 7 hari
-```
-
-**Loss Function:** Pinball Loss (Quantile Loss) pada τ = 0.1, 0.5, 0.9
+| Komponen | Detail |
+|----------|--------|
+| Loss function | Pinball Loss (τ = 0.10, 0.50, 0.90) |
+| Optimizer | AdamW |
+| Scheduler | ReduceLROnPlateau |
+| Early stopping | patience = 15 epoch |
+| Look-back window | 30 hari |
+| Forecast horizon | 7 hari |
 
 ---
 
 ## Pembagian Data
 
-| Split | Proporsi | Jumlah Hari | Periode (approx) |
-|-------|----------|-------------|-----------------|
-| Training | 70% | 2.812 hari | Jan 2014 – Sep 2021 |
-| Validasi | 15% | 603 hari | Sep 2021 – Apr 2023 |
-| Test | 15% | 603 hari | Apr 2023 – Des 2024 |
+| Split | Proporsi | Hari | Periode |
+|-------|----------|------|---------|
+| Training | 70% | 2.812 | Jan 2014 – Sep 2021 |
+| Validasi | 15% | 603 | Sep 2021 – Mei 2023 |
+| Test | 15% | 603 | Mei 2023 – Des 2024 |
 
-> Pembagian **kronologis** (bukan acak) untuk menghindari *data leakage* —
-> model tidak pernah melihat data masa depan saat training.
+> Pembagian **kronologis** — tidak ada data leakage.
 
 ---
 
 ## Hasil Evaluasi (Test Set)
 
-| Metrik | Nilai | Keterangan |
-|--------|-------|-----------|
-| **CRPS** | 0.0978 m³/s | Skor probabilistik gabungan, lebih kecil lebih baik |
-| **PICP** | 94.48% | 94.48% observasi masuk dalam interval [Q10, Q90] — target ≥ 80% ✅ |
-| **PINAW** | 0.0037 | Lebar interval relatif terhadap range observasi, lebih kecil lebih baik |
+| Metrik | Nilai | Target | Status |
+|--------|-------|--------|--------|
+| CRPS | 0.0978 m³/s | lebih kecil = lebih baik | — |
+| PICP | 94.48% | ≥ 80% | ✅ |
+| PINAW | 0.0037 | lebih kecil = lebih baik | — |
 
 ---
 
@@ -258,28 +218,160 @@ Output               [Q10, Q50, Q90] × 7 hari
 | Debit desain per unit | 60,5 m³/s |
 | Jumlah unit | 4 unit |
 | Tipe turbin | Francis Reversible Pumped |
-| Efisiensi turbin (ηT) | 90% |
-| Efisiensi generator (ηG) | 96% |
-| Kecepatan | 500 RPM |
+| Efisiensi turbin ηT | 90% |
+| Efisiensi generator ηG | 96% |
+| Kecepatan | 500 RPM (12 kutub, jaringan 50 Hz) |
 | Tegangan generator | 18 kV |
-| Daya generator | 344 MVA / 275 MW |
+| Rating generator | 344 MVA / 275 MW (pf = 0.80) |
+| Q minimum per unit | 18,15 m³/s (30% × Q_design) |
+
+**Formula daya:**
+```
+P (MW) = ρ × g × Q × H_net × ηT × ηG / 10⁶
+       = 1000 × 9.81 × 60.5 × 486.5 × 0.90 × 0.96 / 10⁶
+       ≈ 249.5 MW per unit  ≈ 250 MW  ✓
+```
 
 ---
 
 ## Cara Penggunaan
 
 ```bash
-# 1. Install dependencies
+# Install dependencies
 pip install -r requirements.txt
 
-# 2. Training model
+# (Opsional) Rebuild dataset dari raw PDF
+python build_raw_dataset.py
+
+# Training model
 python train.py --epochs 100 --lr 0.001
 
-# 3. Evaluasi model
+# Evaluasi model
 python evaluate.py
 
-# 4. Jalankan dashboard
+# Jalankan dashboard
 streamlit run app.py
+```
+
+### Ganti Dataset
+
+Untuk melatih model menggunakan `data_grindulu_raw.csv` (v2 dengan dynamic baseflow),
+ubah satu baris di `preprocess.py`:
+
+```python
+# Sebelum (v1 — baseflow konstan):
+DATA_PATH = "data_grindulu.csv"
+
+# Sesudah (v2 — dynamic baseflow routing):
+DATA_PATH = "data_grindulu_raw.csv"
+```
+
+Kemudian retrain: `python train.py --epochs 100`
+
+---
+
+## Rencana Peningkatan Model
+
+Untuk meningkatkan akurasi dan representasi hidrologi model,
+berikut roadmap berdasarkan prioritas:
+
+---
+
+### Tier 1 — Perubahan Besar (butuh data baru)
+
+#### Data Debit Aktual (AWLR)
+Data terukur langsung dari pos AWLR (Automatic Water Level Recorder) Sungai Grindulu
+akan menggantikan seluruh proxy inflow yang bersifat estimatif.
+
+| Item | Detail |
+|------|--------|
+| Sumber | BBWS Bengawan Solo — pos AWLR terdekat di Sungai Grindulu |
+| Format | Level air harian → konversi via rating curve → m³/s |
+| Dampak | Mengganti semua q_total sintetis dengan data terukur |
+| Prioritas | **Tertinggi** — mengubah penelitian dari estimasi ke kalibrasi nyata |
+
+#### Indeks Iklim ENSO / IOD
+El Niño/La Niña sangat mempengaruhi curah hujan Jawa.
+Model saat ini tidak mengetahui kondisi iklim inter-annual.
+
+| Item | Detail |
+|------|--------|
+| Sumber | NOAA — Oceanic Niño Index (ONI), bulanan |
+| Format | Nilai indeks bulanan (−3 s.d. +3) |
+| Dampak | Model belajar pola musim kering ekstrem (El Niño 2015, 2019, 2023) |
+| Cara integrasi | Tambahkan sebagai fitur encoder bulanan |
+
+---
+
+### Tier 2 — Gratis, Sudah Ada di Dataset (implementasi segera)
+
+#### Curah Hujan Per Stasiun sebagai Fitur Encoder
+Model saat ini hanya menerima `p_das` (rata-rata). Informasi spasial dari
+6 stasiun terpisah dapat meningkatkan akurasi signifikan.
+
+```python
+# Encoder saat ini:
+[p_das, q_total]       # 2 fitur
+
+# Encoder yang ditingkatkan:
+[pacitan, nawangan, kebonagung, bandar, tegalombo, tulakan, q_total]  # 7 fitur
+```
+
+| Stasiun | Korelasi dengan q_total | Keterangan |
+|---------|------------------------|-----------|
+| kebonagung | r = 0.69 | Terbaik |
+| pacitan | r = 0.68 | Terbaik kedua |
+| nawangan | r = 0.37 | Hulu DAS |
+
+#### Seasonal Encoding (Sin/Cos Bulan)
+Model tidak mengetahui posisi musim. Pola musim hujan (Nov–Mar) vs
+musim kemarau (Apr–Okt) sangat kuat di data.
+
+```python
+# Tambahkan ke encoder setiap hari:
+sin_month = sin(2π × month / 12)
+cos_month = cos(2π × month / 12)
+```
+
+---
+
+### Tier 3 — Data Satelit Gratis (perlu download)
+
+| Data | Sumber | Cakupan | Manfaat |
+|------|--------|---------|---------|
+| **CHIRPS Rainfall** | chirps.ucsb.edu | 1981–kini, harian, 0.05° | Curah hujan spasial lebih baik (50+ grid vs 6 stasiun) |
+| **SMAP Soil Moisture** | NASA EarthData | 2015–kini, harian | Kondisi kelembaban tanah awal → akurasi runoff |
+| **ERA5 Temperature** | Copernicus CDS | 1940–kini, harian | Evapotranspirasi nyata (gantikan Pe konstan) |
+
+---
+
+### Tier 4 — Peningkatan Arsitektur (tanpa data baru)
+
+| Perubahan | Cara | Dampak Estimasi |
+|-----------|------|----------------|
+| Tambah fitur stasiun (Tier 2) | Update `preprocess.py` encoder | Sedang–Tinggi |
+| Seasonal encoding | Tambah sin/cos ke encoder | Sedang |
+| Look-back lebih panjang | `ENC_LEN` 30 → 60 hari | Kecil–Sedang |
+| Attention mechanism | Tambah layer attention pada encoder | Sedang |
+| Tambah quantile | Q25, Q75 selain Q10/Q50/Q90 | Kecil |
+
+---
+
+### Prioritas Implementasi
+
+```
+Jangka pendek (tanpa data baru):
+  → Tier 2: Tambah 6 fitur stasiun + seasonal encoding ke encoder
+    File yang diubah: preprocess.py (make_inference_sequence, load_data)
+    Kemudian: retrain model
+
+Jangka menengah (download gratis):
+  → Tier 1: ENSO ONI index (NOAA, bulanan)
+  → Tier 3: ERA5 temperature untuk ET nyata
+
+Jangka panjang (akses institusional):
+  → Tier 1: Data AWLR debit aktual dari BBWS Bengawan Solo
+            → penelitian berubah dari proxy ke kalibrasi nyata
 ```
 
 ---
@@ -288,11 +380,21 @@ streamlit run app.py
 
 | Masalah | Dampak | Penanganan |
 |---------|--------|-----------|
-| Tegalombo Mei–Des 2015 semua nol | ~245 hari P_DAS sedikit lebih rendah | Diterima — data dari Excel sumber |
+| Tegalombo Mei–Des 2015 semua nol | P_DAS sedikit lebih rendah ~245 hari | Diterima — mengikuti data sumber |
 | Tulakan 2020 ~47 hari kosong | P_DAS sedikit lebih rendah | Diterima |
-| Kebonagung Nov 2017: 304+301mm (diduga 30.4+30.1mm) | 2 hari Q_total sangat tinggi | Tidak dikoreksi — menggunakan data Excel sumber |
-| Tegalombo 2017 Feb: 6 hari kosong | Minor | Diterima |
+| Kebonagung Nov 2017: 304+301mm | 2 hari Q_total sangat tinggi | Tidak dikoreksi — menggunakan data sumber |
 | Bandar 2018 & 2022: beberapa hari kosong | Minor | Diterima |
 
-Semua nilai kosong ("-") pada sumber PDF ditangani sebagai **0** di file Excel sumber,
-sehingga `data_grindulu.csv` mencerminkan tepat apa yang ada di `PERHITUNGAN.xlsx`.
+> Semua nilai "-" pada PDF sumber ditangani sebagai **0 mm**.
+> `data_grindulu.csv` mencerminkan tepat apa yang ada di `PERHITUNGAN.xlsx`.
+> `data_grindulu_raw.csv` dibangun langsung dari PDF menggunakan `build_raw_dataset.py`.
+
+---
+
+## Referensi
+
+- Rafsanjani B. Muhammadi & Arham (ITPLN) — *Inflow Forecasting System and Production Optimization Poso Hydropower Plant Using Bi-LSTM Seq2Seq Quantile Regression Model* (referensi metodologi)
+- BBWS Bengawan Solo — Data Hujan Harian 6 Stasiun, 2014–2024
+- Dokumen Pra-FS PLTA Grindulu (spesifikasi turbin dan DAS)
+- SCS National Engineering Handbook Section 4 — Hydrology (CN method)
+- IEC 60193 — Hydraulic turbines, storage pumps and pump-turbines (turbine efficiency)

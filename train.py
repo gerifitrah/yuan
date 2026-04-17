@@ -24,9 +24,7 @@ import torch
 import torch.optim as optim
 
 from model import Seq2SeqQuantile, pinball_loss
-from preprocess import load_data, ENC_LEN, PRED_LEN
-
-SAVE_DIR = os.path.join(os.path.dirname(__file__), "saved_model")
+from preprocess import load_data, ENC_LEN, PRED_LEN, SAVE_DIR
 QUANTILES = (0.1, 0.5, 0.9)
 
 
@@ -46,7 +44,6 @@ def train_one_epoch(model, loader, optimizer, device):
         preds = model(enc_b, dec_b)                  # (batch, pred_len, 3)
         loss  = pinball_loss(preds, tgt_b, QUANTILES)
         loss.backward()
-        # Gradient clipping prevents exploding gradients in deep LSTMs
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         total_loss += loss.item() * enc_b.size(0)

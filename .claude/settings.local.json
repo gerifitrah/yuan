@@ -11,7 +11,9 @@
       "Bash(python preprocess.py)",
       "Bash(python -c \"import train; import evaluate; print\\('all imports OK'\\)\")",
       "Bash(python -c \"import ast; src=open\\('app.py'\\).read\\(\\); ast.parse\\(src\\); print\\('syntax OK'\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(pip install *)"
     ]
   }
 }
