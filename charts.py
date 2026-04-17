@@ -403,6 +403,201 @@ def chart_fixed_vs_variable_speed(
     return fig
 
 
+def chart_probabilistic_forecast(
+    obs: np.ndarray,
+    pred_q10: np.ndarray,
+    pred_q50: np.ndarray,
+    pred_q90: np.ndarray,
+    dates=None,
+    n_show: int = 200,
+    title: str = "Quantile BiLSTM: Probabilistic Inflow Forecast",
+) -> go.Figure:
+    """Chart 7: Confidence band + median + actual — matching the reference paper style.
+
+    Blue/purple shaded band for Q10–Q90, solid blue Q50 median,
+    red dashed actual observed line.
+    """
+    obs      = np.array(obs).flatten()[-n_show:]
+    pred_q10 = np.array(pred_q10).flatten()[-n_show:]
+    pred_q50 = np.array(pred_q50).flatten()[-n_show:]
+    pred_q90 = np.array(pred_q90).flatten()[-n_show:]
+    x        = dates[-n_show:] if dates is not None else np.arange(len(obs))
+
+    fig = go.Figure()
+
+    # Shaded confidence band Q10–Q90
+    fig.add_trace(go.Scatter(
+        x=list(x) + list(x)[::-1],
+        y=list(pred_q90) + list(pred_q10)[::-1],
+        fill="toself",
+        fillcolor="rgba(100, 130, 220, 0.25)",
+        line=dict(color="rgba(0,0,0,0)"),
+        name="10–90% Interval",
+        hoverinfo="skip",
+    ))
+
+    # Q90 border (light)
+    fig.add_trace(go.Scatter(
+        x=x, y=pred_q90, name="Q90 (Upper)",
+        mode="lines",
+        line=dict(color="rgba(100,130,220,0.6)", width=1),
+        showlegend=False,
+    ))
+
+    # Q10 border (light)
+    fig.add_trace(go.Scatter(
+        x=x, y=pred_q10, name="Q10 (Lower)",
+        mode="lines",
+        line=dict(color="rgba(100,130,220,0.6)", width=1),
+        showlegend=False,
+    ))
+
+    # Q50 median — solid blue
+    fig.add_trace(go.Scatter(
+        x=x, y=pred_q50, name="Median (Q50)",
+        mode="lines",
+        line=dict(color="#1f77b4", width=2),
+    ))
+
+    # Actual — red dashed
+    fig.add_trace(go.Scatter(
+        x=x, y=obs, name="Actual",
+        mode="lines",
+        line=dict(color="#d62728", width=1.5, dash="dash"),
+    ))
+
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=14)),
+        xaxis_title="Date",
+        yaxis_title="Inflow Q (m³/s)",
+        legend=dict(
+            orientation="h", y=-0.15,
+            bgcolor="rgba(255,255,255,0.9)",
+            bordercolor="#cccccc", borderwidth=1,
+        ),
+        height=400,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+    )
+    fig.update_yaxes(gridcolor="#eeeeee", showline=True, linecolor="#cccccc")
+    fig.update_xaxes(showgrid=False, showline=True, linecolor="#cccccc")
+    return fig
+
+
+def chart_all_quantiles(
+    obs: np.ndarray,
+    pred_q10: np.ndarray,
+    pred_q50: np.ndarray,
+    pred_q90: np.ndarray,
+    dates=None,
+    n_show: int = 200,
+    title: str = "All Quantile Predictions",
+) -> go.Figure:
+    """Chart 8: All 3 quantile lines plotted together against observed.
+
+    Displays Q10, Q50, Q90 as distinct coloured lines so individual
+    quantile behaviour can be compared directly.
+    """
+    obs      = np.array(obs).flatten()[-n_show:]
+    pred_q10 = np.array(pred_q10).flatten()[-n_show:]
+    pred_q50 = np.array(pred_q50).flatten()[-n_show:]
+    pred_q90 = np.array(pred_q90).flatten()[-n_show:]
+    x        = dates[-n_show:] if dates is not None else np.arange(len(obs))
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=x, y=obs, name="Observed",
+        mode="lines",
+        line=dict(color="#2ca02c", width=2),
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=pred_q90, name="Q90 — Wet",
+        mode="lines",
+        line=dict(color="#1565C0", width=1.5, dash="dash"),
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=pred_q50, name="Q50 — Median",
+        mode="lines",
+        line=dict(color="#d62728", width=2),
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=pred_q10, name="Q10 — Dry",
+        mode="lines",
+        line=dict(color="#ff7f0e", width=1.5, dash="dot"),
+    ))
+
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=14)),
+        xaxis_title="Date",
+        yaxis_title="Inflow Q (m³/s)",
+        legend=dict(
+            orientation="h", y=-0.15,
+            bgcolor="rgba(255,255,255,0.9)",
+            bordercolor="#cccccc", borderwidth=1,
+        ),
+        height=400,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+    )
+    fig.update_yaxes(gridcolor="#eeeeee", showline=True, linecolor="#cccccc")
+    fig.update_xaxes(showgrid=False, showline=True, linecolor="#cccccc")
+    return fig
+
+
+def chart_uncertainty_width(
+    pred_q10: np.ndarray,
+    pred_q90: np.ndarray,
+    dates=None,
+    n_show: int = 200,
+    title: str = "Prediction Uncertainty (10–90% Interval)",
+) -> go.Figure:
+    """Chart 9: Width of the prediction interval (Q90 − Q10) per time step.
+
+    Bar chart with a red dashed mean-uncertainty reference line.
+    Wider bars = model less certain; narrower = more confident.
+    """
+    pred_q10 = np.array(pred_q10).flatten()[-n_show:]
+    pred_q90 = np.array(pred_q90).flatten()[-n_show:]
+    x        = dates[-n_show:] if dates is not None else np.arange(len(pred_q10))
+
+    width     = pred_q90 - pred_q10
+    mean_w    = float(width.mean())
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Bar(
+        x=x, y=width,
+        name="Interval Width (Q90 − Q10)",
+        marker_color="rgba(100, 130, 220, 0.65)",
+        marker_line_color="rgba(60, 90, 180, 0.8)",
+        marker_line_width=0.5,
+    ))
+
+    # Mean uncertainty reference line
+    fig.add_hline(
+        y=mean_w,
+        line_dash="dash", line_color="#d62728", line_width=1.8,
+        annotation_text=f"Mean = {mean_w:.3f} m³/s",
+        annotation_position="top right",
+        annotation_font_color="#d62728",
+    )
+
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=14)),
+        xaxis_title="Date",
+        yaxis_title="Interval Width (m³/s)",
+        legend=dict(orientation="h", y=-0.15),
+        height=400,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+    )
+    fig.update_yaxes(gridcolor="#eeeeee", rangemode="tozero",
+                     showline=True, linecolor="#cccccc")
+    fig.update_xaxes(showgrid=False, showline=True, linecolor="#cccccc")
+    return fig
+
+
 def chart_power_output(
     title: str = "Power Output at Various Flow Conditions — PLTA Grindulu (1000 MW)",
 ) -> go.Figure:

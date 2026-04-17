@@ -22,13 +22,17 @@ import plotly.graph_objects as go
 import streamlit as st
 import torch
 
+from annual_forecast import run_annual_forecast
 from charts import (
+    chart_all_quantiles,
     chart_fixed_vs_variable_speed,
     chart_observed_vs_predicted,
     chart_power_output,
     chart_prediction_interval,
+    chart_probabilistic_forecast,
     chart_quantile_prediction,
     chart_turbine_efficiency,
+    chart_uncertainty_width,
 )
 from evaluate import collect_predictions, compute_crps, compute_picp, compute_pinaw
 from model import Seq2SeqQuantile
@@ -61,6 +65,194 @@ st.set_page_config(
     page_icon="💧",
     layout="wide",
 )
+
+
+# ---------------------------------------------------------------------------
+# Turbine calculation constants (PLTA Grindulu specs)
+# ---------------------------------------------------------------------------
+
+H_NET       = 486.5     # m
+Q_DESIGN    = 60.5      # m³/s per unit
+N_UNITS     = 4
+ETA_T_MAX   = 0.90
+ETA_G       = 0.96
+RHO         = 1000.0
+G_GRAV      = 9.81
+Q_MIN_UNIT  = 0.30 * Q_DESIGN   # 18.15 m³/s minimum per unit
+
+
+def _eta_turbine(q_per_unit: float) -> float:
+    """Francis turbine efficiency as function of Q/Q_design."""
+    q_ratio = q_per_unit / Q_DESIGN
+    eta = ETA_T_MAX * (1 - 0.28 * (q_ratio - 1.0) ** 2)
+    return float(np.clip(eta, 0.0, ETA_T_MAX))
+
+
+def calc_turbine(q_total: float) -> dict:
+    """
+    Given total available inflow Q (m³/s), calculate:
+      - n_units  : number of active generating units
+      - q_unit   : flow per unit (m³/s)
+      - eta_t    : turbine efficiency at this operating point
+      - power_mw : total power output (MW)
+      - energy_mwh: daily energy (MWh = MW × 24 h)
+
+    Unit commitment: maximise active units up to N_UNITS,
+    each unit gets equal share, minimum Q_MIN_UNIT each.
+    """
+    if q_total < Q_MIN_UNIT:
+        return {"n_units": 0, "q_unit": 0.0, "eta_t": 0.0,
+                "power_mw": 0.0, "energy_mwh": 0.0}
+
+    # How many units can run?
+    n = min(int(q_total / Q_MIN_UNIT), N_UNITS)
+    q_per_unit = min(q_total / n, Q_DESIGN)
+    eta_t      = _eta_turbine(q_per_unit)
+    power_mw   = n * RHO * G_GRAV * q_per_unit * H_NET * eta_t * ETA_G / 1e6
+
+    return {
+        "n_units":    n,
+        "q_unit":     round(q_per_unit, 3),
+        "eta_t":      round(eta_t * 100, 2),       # in %
+        "power_mw":   round(power_mw, 2),
+        "energy_mwh": round(power_mw * 24, 1),
+    }
+
+
+def turbine_series(q_array: list | np.ndarray) -> pd.DataFrame:
+    """Apply calc_turbine to an array of Q values, return DataFrame."""
+    rows = [calc_turbine(float(q)) for q in q_array]
+    return pd.DataFrame(rows)
+
+
+def render_turbine_section(
+    date_strs: list,
+    q10: list, q50: list, q90: list,
+    label: str = "",
+):
+    """Render turbine performance chart + table for a forecast result."""
+    from plotly.subplots import make_subplots as _msp
+
+    t10 = turbine_series(q10)
+    t50 = turbine_series(q50)
+    t90 = turbine_series(q90)
+
+    # ---------------------------------------------------------------
+    # Chart: power output + unit count
+    # ---------------------------------------------------------------
+    fig = _msp(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.60, 0.40],
+        vertical_spacing=0.08,
+        subplot_titles=(
+            f"Daya Terbangkit (MW) {label}",
+            "Jumlah Unit Turbin Aktif",
+        ),
+    )
+
+    # Power bars — Q50 (solid), Q10/Q90 error
+    fig.add_trace(go.Bar(
+        x=date_strs, y=t50["power_mw"],
+        name="Daya Q50 — Normal",
+        marker_color="#2E7D32",
+        marker_line_color="#1B5E20",
+        marker_line_width=1,
+        error_y=dict(
+            type="data", symmetric=False,
+            array=(t90["power_mw"] - t50["power_mw"]).clip(lower=0).tolist(),
+            arrayminus=(t50["power_mw"] - t10["power_mw"]).clip(lower=0).tolist(),
+            visible=True, color="#555555",
+        ),
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=date_strs, y=t90["power_mw"],
+        mode="lines", name="Daya Q90 — Basah",
+        line=dict(color="#1565C0", width=1.5, dash="dash"),
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=date_strs, y=t10["power_mw"],
+        mode="lines", name="Daya Q10 — Kering",
+        line=dict(color="#B71C1C", width=1.5, dash="dot"),
+    ), row=1, col=1)
+
+    # Rated capacity line
+    fig.add_hline(
+        y=N_UNITS * 250, line_dash="dot", line_color="gray",
+        annotation_text="Kapasitas penuh 1000 MW",
+        annotation_position="top left",
+        row=1, col=1,
+    )
+
+    # Unit count bar
+    colors_unit = {0: "#eeeeee", 1: "#FFF9C4", 2: "#FFE082",
+                   3: "#FFB300", 4: "#E65100"}
+    unit_colors = [colors_unit.get(int(n), "#cccccc") for n in t50["n_units"]]
+    fig.add_trace(go.Bar(
+        x=date_strs, y=t50["n_units"],
+        name="Jumlah unit (Q50)",
+        marker_color=unit_colors,
+        marker_line_color="#999999",
+        marker_line_width=0.8,
+        text=t50["n_units"].astype(str),
+        textposition="inside",
+    ), row=2, col=1)
+
+    fig.update_layout(
+        height=480,
+        plot_bgcolor="white", paper_bgcolor="white",
+        legend=dict(
+            orientation="h", yanchor="bottom", y=-0.22,
+            xanchor="center", x=0.5,
+            bgcolor="rgba(255,255,255,0.9)",
+            bordercolor="#cccccc", borderwidth=1,
+            font=dict(size=11),
+        ),
+        margin=dict(l=10, r=10, t=50, b=10),
+    )
+    fig.update_yaxes(title_text="Daya (MW)", gridcolor="#eeeeee",
+                     rangemode="tozero", row=1, col=1)
+    fig.update_yaxes(title_text="Unit aktif", gridcolor="#eeeeee",
+                     range=[-0.2, N_UNITS + 0.5], dtick=1, row=2, col=1)
+    fig.update_xaxes(showgrid=False, tickangle=-30, row=2, col=1)
+
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ---------------------------------------------------------------
+    # Summary metrics (Q50 basis)
+    # ---------------------------------------------------------------
+    total_energy = t50["energy_mwh"].sum()
+    max_power    = t50["power_mw"].max()
+    operable     = (t50["power_mw"] > 0).sum()
+    avg_units    = t50["n_units"].mean()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Energi (Q50)", f"{total_energy:,.0f} MWh")
+    c2.metric("Daya Puncak (Q50)",  f"{max_power:.1f} MW")
+    c3.metric("Hari Bisa Bangkit",  f"{operable} hari",
+              help=f"dari {len(date_strs)} hari total")
+    c4.metric("Rata-rata Unit Aktif", f"{avg_units:.1f} unit")
+
+    # ---------------------------------------------------------------
+    # Tabel detail
+    # ---------------------------------------------------------------
+    with st.expander("Tabel Detail Turbin per Hari", expanded=False):
+        tbl = pd.DataFrame({
+            "Tanggal":              date_strs,
+            "Q10 (m³/s)":          np.round(q10, 3),
+            "Q50 (m³/s)":          np.round(q50, 3),
+            "Q90 (m³/s)":          np.round(q90, 3),
+            "Unit Aktif (Q50)":    t50["n_units"].astype(int),
+            "Q/unit (m³/s)":       t50["q_unit"],
+            "Eff. Turbin (%)":     t50["eta_t"],
+            "Daya Q10 (MW)":       t10["power_mw"],
+            "Daya Q50 (MW)":       t50["power_mw"],
+            "Daya Q90 (MW)":       t90["power_mw"],
+            "Energi Harian (MWh)": t50["energy_mwh"],
+        })
+        st.dataframe(tbl, use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -312,17 +504,21 @@ def page_forecast(df: pd.DataFrame, model: Seq2SeqQuantile | None, q_scaler):
     edited_lb = st.data_editor(look_back_df, use_container_width=True, num_rows="fixed")
 
     # ------------------------------------------------------------------
-    # Forecast input — auto-fill from dataset if available, else 0
+    # Forecast input — auto-fill from dataset if available, else climatology
     # ------------------------------------------------------------------
     st.subheader("Curah Hujan Forecast — 7 hari ke depan")
     forecast_dates = [ref_date + pd.Timedelta(days=i) for i in range(PRED_LEN)]
 
-    # Pre-fill P_DAS from dataset if available, else 0 (user inputs manually)
+    # Monthly climatology from historical data (same approach as annual/30-day pages)
+    df["_month"] = df["date"].dt.month
+    monthly_avg  = df.groupby("_month")["p_das"].mean().to_dict()
+
+    # Pre-fill P_DAS: from dataset if date exists, else from monthly climatology
     fc_rows  = []
     actual_q = []
     for fd in forecast_dates:
         row   = df[df["date"] == fd]
-        p_val = float(row["p_das"].values[0])   if len(row) else 0.0
+        p_val = float(row["p_das"].values[0])   if len(row) else round(monthly_avg.get(fd.month, 0.0), 2)
         q_val = float(row["q_total"].values[0]) if len(row) else None
         fc_rows.append({"Tanggal": fd.strftime("%Y-%m-%d"), "P_DAS forecast (mm)": p_val})
         actual_q.append(q_val)
@@ -331,7 +527,10 @@ def page_forecast(df: pd.DataFrame, model: Seq2SeqQuantile | None, q_scaler):
     edited_fc = st.data_editor(forecast_df, use_container_width=True, num_rows="fixed")
 
     if is_future:
-        st.caption("Masukkan perkiraan curah hujan harian (mm) untuk 7 hari ke depan secara manual.")
+        st.caption(
+            "P_DAS diisi otomatis dari **klimatologi historis per bulan** (rata-rata 2014–2024). "
+            "Edit jika ada prakiraan curah hujan lebih akurat (mis. dari BMKG)."
+        )
     elif has_actuals:
         st.info("P_DAS otomatis diisi dari data historis. Setelah prediksi, debit aktual ditampilkan sebagai pembanding.")
 
@@ -360,70 +559,121 @@ def page_forecast(df: pd.DataFrame, model: Seq2SeqQuantile | None, q_scaler):
 
 def _show_forecast_results(preds: np.ndarray, dates, p_fore: np.ndarray, actual_q=None):
     """Render the forecast chart and summary table."""
+    from plotly.subplots import make_subplots
+
     date_strs = [d.strftime("%Y-%m-%d") for d in dates]
+    has_actual = actual_q and any(v is not None for v in actual_q)
 
     # ------------------------------------------------------------------
-    # Plotly chart
+    # Subplot: atas = curah hujan, bawah = inflow Q
     # ------------------------------------------------------------------
-    fig = go.Figure()
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.28, 0.72],
+        vertical_spacing=0.06,
+        subplot_titles=("Curah Hujan Forecast P_DAS (mm)", "Prediksi Inflow Q (m³/s)"),
+    )
 
-    # Confidence band q10–q90
+    # --- Baris 1: Curah Hujan ---
+    fig.add_trace(go.Bar(
+        x=date_strs,
+        y=p_fore,
+        name="P_DAS (mm)",
+        marker_color="#4C9BE8",
+        marker_line_color="#1a6bbf",
+        marker_line_width=1.2,
+        showlegend=True,
+    ), row=1, col=1)
+
+    # --- Baris 2: Confidence band Q10–Q90 ---
     fig.add_trace(go.Scatter(
         x=date_strs + date_strs[::-1],
         y=list(preds[:, 2]) + list(preds[:, 0])[::-1],
         fill="toself",
-        fillcolor="rgba(31,119,180,0.2)",
-        line=dict(color="rgba(255,255,255,0)"),
-        name="Q10–Q90 band",
+        fillcolor="rgba(255, 165, 0, 0.15)",
+        line=dict(color="rgba(0,0,0,0)"),
+        name="Interval Q10–Q90",
         hoverinfo="skip",
-    ))
-    # Q50 (median)
-    fig.add_trace(go.Scatter(
-        x=date_strs, y=preds[:, 1],
-        mode="lines+markers", name="Q50 — Normal",
-        line=dict(color=QUANTILE_COLORS["q50"], width=2.5),
-        marker=dict(size=7),
-    ))
-    # Q90 (wet)
+        showlegend=True,
+    ), row=2, col=1)
+
+    # Q90 — Basah
     fig.add_trace(go.Scatter(
         x=date_strs, y=preds[:, 2],
-        mode="lines+markers", name="Q90 — Wet",
-        line=dict(color=QUANTILE_COLORS["q90"], dash="dot", width=1.5),
-        marker=dict(size=5),
-    ))
-    # Q10 (dry)
+        mode="lines+markers",
+        name="Q90 — Basah",
+        line=dict(color="#1565C0", width=2, dash="dash"),
+        marker=dict(size=8, symbol="triangle-up", color="#1565C0"),
+    ), row=2, col=1)
+
+    # Q50 — Normal
+    fig.add_trace(go.Scatter(
+        x=date_strs, y=preds[:, 1],
+        mode="lines+markers",
+        name="Q50 — Normal",
+        line=dict(color="#2E7D32", width=3),
+        marker=dict(size=10, symbol="circle", color="#2E7D32",
+                    line=dict(color="white", width=1.5)),
+    ), row=2, col=1)
+
+    # Q10 — Kering
     fig.add_trace(go.Scatter(
         x=date_strs, y=preds[:, 0],
-        mode="lines+markers", name="Q10 — Dry",
-        line=dict(color=QUANTILE_COLORS["q10"], dash="dot", width=1.5),
-        marker=dict(size=5),
-    ))
-    # Rainfall bar on secondary axis
-    fig.add_trace(go.Bar(
-        x=date_strs, y=p_fore,
-        name="P_DAS forecast (mm)", yaxis="y2",
-        marker_color="rgba(31,119,180,0.35)",
-    ))
+        mode="lines+markers",
+        name="Q10 — Kering",
+        line=dict(color="#B71C1C", width=2, dash="dot"),
+        marker=dict(size=8, symbol="triangle-down", color="#B71C1C"),
+    ), row=2, col=1)
 
-    # Actual observed Q (if available from historical data)
-    if actual_q and any(v is not None for v in actual_q):
+    # Aktual (jika ada)
+    if has_actual:
         actual_vals = [v if v is not None else None for v in actual_q]
         fig.add_trace(go.Scatter(
             x=date_strs, y=actual_vals,
-            mode="lines+markers", name="Aktual (observed)",
-            line=dict(color="black", width=2, dash="dash"),
-            marker=dict(size=8, symbol="circle-open"),
-        ))
+            mode="lines+markers",
+            name="Aktual (observed)",
+            line=dict(color="#000000", width=2.5),
+            marker=dict(size=10, symbol="circle-open",
+                        color="#000000", line=dict(width=2.5)),
+        ), row=2, col=1)
 
     fig.update_layout(
-        title="7-Day Inflow Forecast — PLTA Grindulu",
-        xaxis_title="Tanggal",
-        yaxis=dict(title="Inflow Q (m³/s)", rangemode="tozero"),
-        yaxis2=dict(title="Curah Hujan (mm)", overlaying="y", side="right", autorange="reversed"),
-        legend=dict(orientation="h", y=-0.2),
-        height=460,
-        margin=dict(l=0, r=0, t=40, b=0),
+        title=dict(
+            text="7-Day Inflow Forecast — PLTA Grindulu",
+            font=dict(size=16),
+        ),
+        height=560,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=-0.22,
+            xanchor="center", x=0.5,
+            bgcolor="rgba(255,255,255,0.9)",
+            bordercolor="#cccccc",
+            borderwidth=1,
+            font=dict(size=12),
+        ),
+        margin=dict(l=10, r=10, t=60, b=10),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
     )
+
+    # Axis styling
+    fig.update_yaxes(
+        title_text="P_DAS (mm)", row=1, col=1,
+        gridcolor="#eeeeee", showline=True, linecolor="#cccccc",
+    )
+    fig.update_yaxes(
+        title_text="Inflow Q (m³/s)", row=2, col=1,
+        rangemode="tozero",
+        gridcolor="#eeeeee", showline=True, linecolor="#cccccc",
+    )
+    fig.update_xaxes(
+        showgrid=False, showline=True,
+        linecolor="#cccccc", tickformat="%d %b",
+        row=2, col=1,
+    )
+
     st.plotly_chart(fig, use_container_width=True)
 
     # ------------------------------------------------------------------
@@ -466,6 +716,545 @@ def _show_forecast_results(preds: np.ndarray, dates, p_fore: np.ndarray, actual_
         file_name="grindulu_forecast.csv",
         mime="text/csv",
     )
+
+    # ---------------------------------------------------------------
+    # Turbine performance section
+    # ---------------------------------------------------------------
+    st.divider()
+    st.subheader("Performa Turbin — 7 Hari")
+    render_turbine_section(
+        date_strs,
+        q10=preds[:, 0].tolist(),
+        q50=preds[:, 1].tolist(),
+        q90=preds[:, 2].tolist(),
+        label="(7 Hari ke Depan)",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Page: Annual Simulation
+# ---------------------------------------------------------------------------
+
+def page_annual(df: pd.DataFrame, model):
+    st.header("Simulasi Prediksi Inflow Tahunan")
+    st.markdown(
+        "Prediksi inflow selama **1 tahun penuh** menggunakan metode **rolling forecast** — "
+        "model memprediksi 7 hari per langkah secara iteratif hingga 365 hari. "
+        "P_DAS yang digunakan adalah rata-rata klimatologi per bulan dari data historis 2014–2024."
+    )
+
+    if model is None:
+        st.error("Train model terlebih dahulu.")
+        return
+
+    col1, col2 = st.columns(2)
+    target_year = col1.selectbox(
+        "Tahun simulasi",
+        list(range(2025, pd.Timestamp.now().year + 6)),
+        index=0,
+    )
+    scenario = col2.selectbox(
+        "Skenario curah hujan",
+        ["normal", "dry", "wet"],
+        format_func=lambda s: {
+            "normal": "Normal (klimatologi rata-rata)",
+            "dry":    "Kering — 70% dari rata-rata",
+            "wet":    "Basah — 130% dari rata-rata",
+        }[s],
+    )
+
+    if st.button("▶ Jalankan Simulasi Tahunan", type="primary"):
+        with st.spinner(f"Menghitung prediksi 365 hari untuk tahun {target_year}..."):
+            df_ann = run_annual_forecast(target_year=target_year, scenario=scenario)
+
+        st.success(f"Selesai — {len(df_ann)} hari diprediksi.")
+
+        # ---------------------------------------------------------------
+        # Chart: time series (subplot — rainfall atas, inflow bawah)
+        # ---------------------------------------------------------------
+        from plotly.subplots import make_subplots as _msp
+        fig = _msp(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            row_heights=[0.25, 0.75],
+            vertical_spacing=0.05,
+            subplot_titles=(
+                "Curah Hujan Klimatologi P_DAS (mm)",
+                f"Prediksi Inflow Q (m³/s) — Tahun {target_year}",
+            ),
+        )
+
+        # Curah hujan
+        fig.add_trace(go.Bar(
+            x=df_ann["date"], y=df_ann["p_das_used"],
+            name="P_DAS (mm)",
+            marker_color="#4C9BE8",
+            marker_line_color="#1a6bbf",
+            marker_line_width=0.5,
+        ), row=1, col=1)
+
+        # Band Q10–Q90
+        fig.add_trace(go.Scatter(
+            x=list(df_ann["date"]) + list(df_ann["date"])[::-1],
+            y=list(df_ann["q90"]) + list(df_ann["q10"])[::-1],
+            fill="toself",
+            fillcolor="rgba(255,165,0,0.15)",
+            line=dict(color="rgba(0,0,0,0)"),
+            name="Interval Q10–Q90",
+            hoverinfo="skip",
+        ), row=2, col=1)
+
+        # Q90
+        fig.add_trace(go.Scatter(
+            x=df_ann["date"], y=df_ann["q90"],
+            mode="lines", name="Q90 — Basah",
+            line=dict(color="#1565C0", width=1.5, dash="dash"),
+        ), row=2, col=1)
+
+        # Q50
+        fig.add_trace(go.Scatter(
+            x=df_ann["date"], y=df_ann["q50"],
+            mode="lines", name="Q50 — Normal",
+            line=dict(color="#2E7D32", width=2.5),
+        ), row=2, col=1)
+
+        # Q10
+        fig.add_trace(go.Scatter(
+            x=df_ann["date"], y=df_ann["q10"],
+            mode="lines", name="Q10 — Kering",
+            line=dict(color="#B71C1C", width=1.5, dash="dot"),
+        ), row=2, col=1)
+
+        fig.update_layout(
+            title=dict(
+                text=f"Simulasi Inflow Tahunan {target_year} — Skenario: {scenario.upper()}",
+                font=dict(size=15),
+            ),
+            height=560,
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            legend=dict(
+                orientation="h",
+                yanchor="bottom", y=-0.18,
+                xanchor="center", x=0.5,
+                bgcolor="rgba(255,255,255,0.9)",
+                bordercolor="#cccccc", borderwidth=1,
+                font=dict(size=12),
+            ),
+            margin=dict(l=10, r=10, t=60, b=10),
+        )
+        fig.update_yaxes(title_text="P_DAS (mm)", gridcolor="#eeeeee", row=1, col=1)
+        fig.update_yaxes(title_text="Q (m³/s)", rangemode="tozero", gridcolor="#eeeeee", row=2, col=1)
+        fig.update_xaxes(showgrid=False, tickformat="%b '%y", row=2, col=1)
+        st.plotly_chart(fig, use_container_width=True)
+
+        # ---------------------------------------------------------------
+        # Chart: monthly average bar chart
+        # ---------------------------------------------------------------
+        df_ann["month"] = df_ann["date"].dt.month
+        monthly = df_ann.groupby("month")[["q10","q50","q90"]].mean().reset_index()
+        monthly["month_name"] = monthly["month"].apply(
+            lambda m: pd.Timestamp(2000, m, 1).strftime("%b")
+        )
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Bar(
+            x=monthly["month_name"], y=monthly["q50"],
+            name="Q50 — Normal",
+            marker_color="#2ca02c",
+            error_y=dict(
+                type="data",
+                symmetric=False,
+                array=(monthly["q90"] - monthly["q50"]).values,
+                arrayminus=(monthly["q50"] - monthly["q10"]).values,
+                visible=True,
+            ),
+        ))
+        fig2.update_layout(
+            title=f"Rata-rata Inflow per Bulan — {target_year} (error bar = Q10/Q90)",
+            xaxis_title="Bulan",
+            yaxis_title="Q (m³/s)",
+            height=380,
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+        # ---------------------------------------------------------------
+        # Summary table per month
+        # ---------------------------------------------------------------
+        monthly_display = monthly.copy()
+        monthly_display.columns = ["Bulan No", "Q10 (m³/s)", "Q50 (m³/s)", "Q90 (m³/s)", "Bulan"]
+        monthly_display = monthly_display[["Bulan", "Q10 (m³/s)", "Q50 (m³/s)", "Q90 (m³/s)"]]
+        for col in ["Q10 (m³/s)", "Q50 (m³/s)", "Q90 (m³/s)"]:
+            monthly_display[col] = monthly_display[col].round(3)
+
+        st.subheader("Ringkasan per Bulan")
+        st.dataframe(monthly_display, use_container_width=True, hide_index=True)
+
+        # ---------------------------------------------------------------
+        # Statistik operasional turbin
+        # ---------------------------------------------------------------
+        Q_MIN_1_UNIT = 0.30 * 60.5
+        days_operable = (df_ann["q50"] >= Q_MIN_1_UNIT).sum()
+        st.subheader("Implikasi Operasional Turbin")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Hari Q50 >= min 1 unit", f"{days_operable} hari",
+                  help=f"Q minimum 1 unit = {Q_MIN_1_UNIT:.1f} m³/s")
+        c2.metric("Rata-rata Q50 tahunan", f"{df_ann['q50'].mean():.3f} m³/s")
+        c3.metric("Q50 maksimum", f"{df_ann['q50'].max():.2f} m³/s",
+                  help=f"Terjadi pada {df_ann.loc[df_ann['q50'].idxmax(), 'date'].strftime('%d %b %Y')}")
+
+        # Download
+        csv = df_ann.drop(columns=["step","month"], errors="ignore").to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download hasil simulasi CSV",
+            data=csv,
+            file_name=f"annual_forecast_{target_year}_{scenario}.csv",
+            mime="text/csv",
+        )
+
+        st.caption(
+            "Catatan: prediksi rolling mengakumulasi error semakin jauh ke depan. "
+            "Akurasi paling tinggi di bulan Jan–Feb, menurun di akhir tahun. "
+            "P_DAS yang digunakan adalah klimatologi historis — bukan prakiraan cuaca nyata."
+        )
+
+        # ---------------------------------------------------------------
+        # Turbine performance — tahunan
+        # ---------------------------------------------------------------
+        st.divider()
+        st.subheader(f"Performa Turbin — Tahun {target_year}")
+        ann_dates = df_ann["date"].dt.strftime("%Y-%m-%d").tolist()
+        render_turbine_section(
+            ann_dates,
+            q10=df_ann["q10"].tolist(),
+            q50=df_ann["q50"].tolist(),
+            q90=df_ann["q90"].tolist(),
+            label=f"(Tahun {target_year} — Skenario {scenario.upper()})",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Page: 30-Day Forecast
+# ---------------------------------------------------------------------------
+
+def page_monthly(df: pd.DataFrame, model, q_scaler):
+    st.header("Prediksi Inflow 30 Hari ke Depan")
+    st.markdown(
+        "Prediksi debit inflow selama **30 hari** menggunakan rolling forecast — "
+        "model berjalan 7 hari per langkah sebanyak 4–5 kali iterasi."
+    )
+
+    if model is None or q_scaler is None:
+        st.error("Train model terlebih dahulu.")
+        return
+
+    import calendar as _cal
+
+    # ------------------------------------------------------------------
+    # Pilih tanggal mulai
+    # ------------------------------------------------------------------
+    data_end   = df["date"].max()
+    data_start = df["date"].min() + pd.Timedelta(days=ENC_LEN)
+
+    st.markdown("Pilih **tanggal mulai** prediksi 30 hari:")
+    col_y, col_m, col_d = st.columns(3)
+
+    years   = list(range(data_start.year, pd.Timestamp.now().year + 6))
+    default_ref = max(pd.Timestamp.now().normalize(), data_end + pd.Timedelta(days=1))
+    default_yi  = years.index(default_ref.year) if default_ref.year in years else len(years)-1
+
+    sel_year  = col_y.selectbox("Tahun", years, index=default_yi, key="m_year")
+    sel_month = col_m.selectbox(
+        "Bulan", list(range(1, 13)),
+        index=default_ref.month - 1,
+        format_func=lambda m: pd.Timestamp(2000, m, 1).strftime("%B"),
+        key="m_month",
+    )
+    max_day   = _cal.monthrange(sel_year, sel_month)[1]
+    sel_day   = col_d.selectbox("Hari", list(range(1, max_day + 1)),
+                                index=min(default_ref.day, max_day) - 1, key="m_day")
+
+    try:
+        ref_date = pd.Timestamp(sel_year, sel_month, sel_day)
+    except Exception:
+        st.error("Tanggal tidak valid.")
+        return
+
+    is_future = ref_date > data_end
+    end_date  = ref_date + pd.Timedelta(days=29)
+
+    st.caption(
+        f"Periode prediksi: **{ref_date.date()}** s.d. **{end_date.date()}** (30 hari)"
+    )
+
+    # ------------------------------------------------------------------
+    # Look-back
+    # ------------------------------------------------------------------
+    if is_future:
+        lb_df = df.tail(ENC_LEN).reset_index(drop=True)
+        st.info(f"Tanggal di luar dataset — look-back otomatis dari 30 hari terakhir dataset ({data_end.date()}).")
+    else:
+        lb_df = df[df["date"] < ref_date].tail(ENC_LEN).reset_index(drop=True)
+
+    if len(lb_df) < ENC_LEN:
+        st.error("Data look-back tidak cukup.")
+        return
+
+    with st.expander("Look-back window (30 hari sebelum tanggal referensi)", expanded=False):
+        lb_edit = lb_df[["date", "p_das", "q_total"]].copy()
+        lb_edit["date"] = lb_edit["date"].dt.strftime("%Y-%m-%d")
+        lb_edit = st.data_editor(lb_edit, use_container_width=True, num_rows="fixed", key="lb_30")
+
+    # ------------------------------------------------------------------
+    # Input curah hujan 30 hari
+    # ------------------------------------------------------------------
+    st.subheader("Input Curah Hujan 30 Hari (P_DAS mm/hari)")
+
+    # Auto-fill: dari dataset jika ada, kalau tidak dari klimatologi
+    df["month"] = df["date"].dt.month
+    monthly_avg = df.groupby("month")["p_das"].mean().to_dict()
+
+    fc_rows  = []
+    actual_q = []
+    for i in range(30):
+        d    = ref_date + pd.Timedelta(days=i)
+        row  = df[df["date"] == d]
+        if len(row):
+            p_val = float(row["p_das"].values[0])
+            q_val = float(row["q_total"].values[0])
+        else:
+            p_val = round(monthly_avg.get(d.month, 0.0), 2)
+            q_val = None
+        fc_rows.append({
+            "Tanggal": d.strftime("%Y-%m-%d"),
+            "P_DAS (mm)": p_val,
+        })
+        actual_q.append(q_val)
+
+    fc_df   = pd.DataFrame(fc_rows)
+    fc_edit = st.data_editor(fc_df, use_container_width=True, num_rows="fixed", key="fc_30")
+
+    if is_future:
+        st.caption("P_DAS diisi dari klimatologi historis per bulan. Edit sesuai prakiraan BMKG.")
+    else:
+        st.caption("P_DAS diisi dari data historis (jika tersedia) atau klimatologi.")
+
+    # ------------------------------------------------------------------
+    # Rolling forecast 30 hari
+    # ------------------------------------------------------------------
+    if st.button("▶ Prediksi 30 Hari", type="primary"):
+        with st.spinner("Menghitung prediksi 30 hari..."):
+            p_hist_arr = lb_edit["p_das"].astype(float).values
+            q_hist_arr = lb_edit["q_total"].astype(float).values
+            p_fore_all = fc_edit["P_DAS (mm)"].astype(float).values  # (30,)
+
+            # Rolling: 7 hari per step
+            import pickle as _pk
+            with open(FEATURE_SCALER, "rb") as f:
+                scalers = _pk.load(f)
+            p_sc = scalers["p_scaler"]
+
+            p_buf = list(p_hist_arr)
+            q_buf = list(q_hist_arr)
+
+            all_q10, all_q50, all_q90 = [], [], []
+            all_dates = [ref_date + pd.Timedelta(days=i) for i in range(30)]
+
+            for step_start in range(0, 30, PRED_LEN):
+                step_end = min(step_start + PRED_LEN, 30)
+                p_fore_step = p_fore_all[step_start:step_end]
+
+                # Pad to PRED_LEN if last step is shorter
+                pad = PRED_LEN - len(p_fore_step)
+                p_fore_padded = np.pad(p_fore_step.astype(np.float32), (0, pad), mode="edge")
+
+                enc_t, dec_t = make_inference_sequence(
+                    np.array(p_buf[-ENC_LEN:], dtype=np.float32),
+                    np.array(q_buf[-ENC_LEN:], dtype=np.float32),
+                    p_fore_padded,
+                )
+
+                with torch.no_grad():
+                    out = model(enc_t, dec_t).squeeze(0).numpy()
+
+                n_q = out.shape[1]
+                out_orig = q_scaler.inverse_transform(
+                    out.reshape(-1, 1)
+                ).reshape(PRED_LEN, n_q)
+                out_orig = np.sort(out_orig, axis=-1)
+
+                actual_step = step_end - step_start
+                for j in range(actual_step):
+                    all_q10.append(float(out_orig[j, 0]))
+                    all_q50.append(float(out_orig[j, 1]))
+                    all_q90.append(float(out_orig[j, 2]))
+                    p_buf.append(float(p_fore_step[j] if j < len(p_fore_step) else p_fore_step[-1]))
+                    q_buf.append(float(out_orig[j, 1]))
+
+        # ---------------------------------------------------------------
+        # Chart
+        # ---------------------------------------------------------------
+        from plotly.subplots import make_subplots as _msp2
+        date_strs = [d.strftime("%Y-%m-%d") for d in all_dates]
+
+        fig = _msp2(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            row_heights=[0.25, 0.75],
+            vertical_spacing=0.05,
+            subplot_titles=(
+                "Curah Hujan P_DAS (mm)",
+                "Prediksi Inflow Q (m³/s) — 30 Hari",
+            ),
+        )
+
+        # Curah hujan
+        fig.add_trace(go.Bar(
+            x=date_strs, y=p_fore_all.tolist(),
+            name="P_DAS (mm)",
+            marker_color="#4C9BE8",
+            marker_line_color="#1a6bbf",
+            marker_line_width=0.8,
+        ), row=1, col=1)
+
+        # Band Q10–Q90
+        fig.add_trace(go.Scatter(
+            x=date_strs + date_strs[::-1],
+            y=all_q90 + all_q10[::-1],
+            fill="toself",
+            fillcolor="rgba(255,165,0,0.15)",
+            line=dict(color="rgba(0,0,0,0)"),
+            name="Interval Q10–Q90",
+            hoverinfo="skip",
+        ), row=2, col=1)
+
+        # Q90
+        fig.add_trace(go.Scatter(
+            x=date_strs, y=all_q90,
+            mode="lines", name="Q90 — Basah",
+            line=dict(color="#1565C0", width=2, dash="dash"),
+        ), row=2, col=1)
+
+        # Q50
+        fig.add_trace(go.Scatter(
+            x=date_strs, y=all_q50,
+            mode="lines+markers", name="Q50 — Normal",
+            line=dict(color="#2E7D32", width=3),
+            marker=dict(size=6, color="#2E7D32",
+                        line=dict(color="white", width=1)),
+        ), row=2, col=1)
+
+        # Q10
+        fig.add_trace(go.Scatter(
+            x=date_strs, y=all_q10,
+            mode="lines", name="Q10 — Kering",
+            line=dict(color="#B71C1C", width=2, dash="dot"),
+        ), row=2, col=1)
+
+        # Aktual (jika ada dalam dataset)
+        has_act = any(v is not None for v in actual_q)
+        if has_act:
+            fig.add_trace(go.Scatter(
+                x=date_strs,
+                y=[v if v is not None else None for v in actual_q],
+                mode="lines+markers", name="Aktual (observed)",
+                line=dict(color="#000000", width=2.5),
+                marker=dict(size=7, symbol="circle-open",
+                            color="#000000", line=dict(width=2)),
+            ), row=2, col=1)
+
+        # Garis batas minimum turbin
+        Q_MIN = 0.30 * 60.5
+        fig.add_hline(
+            y=Q_MIN, line_dash="dot", line_color="gray",
+            annotation_text=f"Q_min 1 unit = {Q_MIN:.1f} m³/s",
+            annotation_position="top right",
+            row=2, col=1,
+        )
+
+        fig.update_layout(
+            title=dict(
+                text=f"Prediksi Inflow 30 Hari — {ref_date.strftime('%d %B %Y')} s.d. {end_date.strftime('%d %B %Y')}",
+                font=dict(size=15),
+            ),
+            height=580,
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+            legend=dict(
+                orientation="h",
+                yanchor="bottom", y=-0.20,
+                xanchor="center", x=0.5,
+                bgcolor="rgba(255,255,255,0.9)",
+                bordercolor="#cccccc", borderwidth=1,
+                font=dict(size=12),
+            ),
+            margin=dict(l=10, r=10, t=60, b=10),
+        )
+        fig.update_yaxes(title_text="P_DAS (mm)", gridcolor="#eeeeee", row=1, col=1)
+        fig.update_yaxes(title_text="Q (m³/s)", rangemode="tozero",
+                         gridcolor="#eeeeee", row=2, col=1)
+        fig.update_xaxes(showgrid=False, tickformat="%d %b", tickangle=-30, row=2, col=1)
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        # ---------------------------------------------------------------
+        # Metrics
+        # ---------------------------------------------------------------
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Rata-rata Q50", f"{np.mean(all_q50):.3f} m³/s")
+        c2.metric("Q50 Maksimum", f"{max(all_q50):.2f} m³/s",
+                  help=f"Hari ke-{all_q50.index(max(all_q50))+1} ({date_strs[all_q50.index(max(all_q50))]})")
+        c3.metric("Q50 Minimum",  f"{min(all_q50):.3f} m³/s")
+        days_op = sum(1 for q in all_q50 if q >= Q_MIN)
+        c4.metric("Hari bisa operasi turbin", f"{days_op} / 30 hari",
+                  help=f"Q >= {Q_MIN:.1f} m³/s (min 1 unit)")
+
+        # MAE jika ada aktual
+        if has_act:
+            obs = np.array([v for v in actual_q if v is not None])
+            pred_q50_match = np.array([all_q50[i] for i, v in enumerate(actual_q) if v is not None])
+            mae  = np.mean(np.abs(obs - pred_q50_match))
+            rmse = np.sqrt(np.mean((obs - pred_q50_match)**2))
+            st.info(f"Vs Aktual — MAE: **{mae:.3f} m³/s** | RMSE: **{rmse:.3f} m³/s**")
+
+        # ---------------------------------------------------------------
+        # Tabel lengkap
+        # ---------------------------------------------------------------
+        with st.expander("Tabel Prediksi Lengkap (30 hari)", expanded=False):
+            tbl = pd.DataFrame({
+                "Tanggal":             date_strs,
+                "P_DAS (mm)":          p_fore_all.round(1),
+                "Q10 — Kering (m³/s)": np.round(all_q10, 4),
+                "Q50 — Normal (m³/s)": np.round(all_q50, 4),
+                "Q90 — Basah (m³/s)":  np.round(all_q90, 4),
+                "Aktual (m³/s)":       [f"{v:.3f}" if v is not None else "—"
+                                        for v in actual_q],
+            })
+            st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+            csv = tbl.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download CSV",
+                data=csv,
+                file_name=f"forecast_30hari_{ref_date.strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+            )
+
+        st.caption(
+            "Prediksi rolling: akurasi tertinggi di 7 hari pertama, "
+            "menurun di hari 8–30 karena prediksi sebelumnya dipakai sebagai look-back."
+        )
+
+        # ---------------------------------------------------------------
+        # Turbine performance — 30 hari
+        # ---------------------------------------------------------------
+        st.divider()
+        st.subheader("Performa Turbin — 30 Hari")
+        render_turbine_section(
+            date_strs,
+            q10=all_q10, q50=all_q50, q90=all_q90,
+            label="(30 Hari ke Depan)",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +1318,34 @@ def page_analysis(model, q_scaler):
 
         n_show = st.slider("Points to display in time-series charts", 50, 500, 200, 50)
 
+        # ---------------------------------------------------------------
+        # Reference-paper style charts (7, 8, 9) — top row
+        # ---------------------------------------------------------------
+        st.markdown("#### BiLSTM Quantile — Paper-Style Charts")
+
+        with st.expander("Chart 7 — Probabilistic Forecast (Confidence Band)", expanded=True):
+            st.plotly_chart(
+                chart_probabilistic_forecast(obs_flat, q10_flat, q50_flat, q90_flat, n_show=n_show),
+                use_container_width=True,
+            )
+
+        col_left, col_right = st.columns(2)
+        with col_left:
+            with st.expander("Chart 8 — All Quantile Predictions", expanded=True):
+                st.plotly_chart(
+                    chart_all_quantiles(obs_flat, q10_flat, q50_flat, q90_flat, n_show=n_show),
+                    use_container_width=True,
+                )
+        with col_right:
+            with st.expander("Chart 9 — Prediction Uncertainty Width", expanded=True):
+                st.plotly_chart(
+                    chart_uncertainty_width(q10_flat, q90_flat, n_show=n_show),
+                    use_container_width=True,
+                )
+
+        st.divider()
+        st.markdown("#### Standard Evaluation Charts")
+
         with st.expander("Chart 1 — Observed vs Predicted (Q50)", expanded=True):
             st.plotly_chart(
                 chart_observed_vs_predicted(obs_flat, q50_flat),
@@ -591,9 +1408,11 @@ def main():
 
     render_sidebar(df)
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📈 Historical Data",
         "🔮 7-Day Forecast",
+        "📆 30-Day Forecast",
+        "📅 Simulasi Tahunan",
         "📊 Analysis & Turbine Performance",
     ])
     with tab1:
@@ -601,6 +1420,10 @@ def main():
     with tab2:
         page_forecast(df, model, q_scaler)
     with tab3:
+        page_monthly(df, model, q_scaler)
+    with tab4:
+        page_annual(df, model)
+    with tab5:
         page_analysis(model, q_scaler)
 
 
