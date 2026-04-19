@@ -22,7 +22,6 @@ import plotly.graph_objects as go
 import streamlit as st
 import torch
 
-from annual_forecast import run_annual_forecast
 from charts import (
     chart_all_quantiles,
     chart_fixed_vs_variable_speed,
@@ -735,202 +734,205 @@ def _show_forecast_results(preds: np.ndarray, dates, p_fore: np.ndarray, actual_
 # Page: Annual Simulation
 # ---------------------------------------------------------------------------
 
-def page_annual(df: pd.DataFrame, model):
-    st.header("Simulasi Prediksi Inflow Tahunan")
+def page_annual(df: pd.DataFrame):
+    st.header("Simulasi Inflow Tahunan — Klimatologi")
     st.markdown(
-        "Prediksi inflow selama **1 tahun penuh** menggunakan metode **rolling forecast** — "
-        "model memprediksi 7 hari per langkah secara iteratif hingga 365 hari. "
-        "P_DAS yang digunakan adalah rata-rata klimatologi per bulan dari data historis 2014–2024."
+        "Distribusi Q10/Q50/Q90 dihitung langsung dari **data historis 2014–2024** per bulan. "
+        "Tidak ada error akumulasi — setiap bulan independen berdasarkan pola historis aktual."
     )
 
-    if model is None:
-        st.error("Train model terlebih dahulu.")
-        return
-
     col1, col2 = st.columns(2)
+    data_years  = sorted(df["date"].dt.year.unique().tolist())
+    first_year  = data_years[0]
+    all_years   = list(range(first_year, pd.Timestamp.now().year + 6))
+    default_idx = all_years.index(2025) if 2025 in all_years else len(all_years) - 1
     target_year = col1.selectbox(
         "Tahun simulasi",
-        list(range(2025, pd.Timestamp.now().year + 6)),
-        index=0,
+        all_years,
+        index=default_idx,
     )
     scenario = col2.selectbox(
         "Skenario curah hujan",
         ["normal", "dry", "wet"],
         format_func=lambda s: {
-            "normal": "Normal (klimatologi rata-rata)",
+            "normal": "Normal (100% klimatologi)",
             "dry":    "Kering — 70% dari rata-rata",
             "wet":    "Basah — 130% dari rata-rata",
         }[s],
     )
 
-    if st.button("▶ Jalankan Simulasi Tahunan", type="primary"):
-        with st.spinner(f"Menghitung prediksi 365 hari untuk tahun {target_year}..."):
-            df_ann = run_annual_forecast(target_year=target_year, scenario=scenario)
+    multiplier = {"dry": 0.70, "normal": 1.00, "wet": 1.30}[scenario]
 
-        st.success(f"Selesai — {len(df_ann)} hari diprediksi.")
+    # ------------------------------------------------------------------
+    # Select data source: single year (if in dataset) or all-year climatology
+    # ------------------------------------------------------------------
+    df_c = df.copy()
+    df_c["month"] = df_c["date"].dt.month
+    df_c["year"]  = df_c["date"].dt.year
 
-        # ---------------------------------------------------------------
-        # Chart: time series (subplot — rainfall atas, inflow bawah)
-        # ---------------------------------------------------------------
-        from plotly.subplots import make_subplots as _msp
-        fig = _msp(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            row_heights=[0.25, 0.75],
-            vertical_spacing=0.05,
-            subplot_titles=(
-                "Curah Hujan Klimatologi P_DAS (mm)",
-                f"Prediksi Inflow Q (m³/s) — Tahun {target_year}",
-            ),
+    is_historical = target_year in data_years
+    df_src = df_c[df_c["year"] == target_year] if is_historical else df_c
+
+    if is_historical:
+        st.info(
+            f"Tahun **{target_year}** ada dalam dataset — menampilkan distribusi "
+            f"Q10/Q50/Q90 dari data aktual tahun {target_year}."
         )
+    else:
+        st.caption("Data klimatologi berdasarkan rata-rata historis 2014–2024.")
 
-        # Curah hujan
-        fig.add_trace(go.Bar(
-            x=df_ann["date"], y=df_ann["p_das_used"],
-            name="P_DAS (mm)",
-            marker_color="#4C9BE8",
-            marker_line_color="#1a6bbf",
-            marker_line_width=0.5,
-        ), row=1, col=1)
+    q10_hist = df_src.groupby("month")["q_total"].quantile(0.10)
+    q50_hist = df_src.groupby("month")["q_total"].quantile(0.50)
+    q90_hist = df_src.groupby("month")["q_total"].quantile(0.90)
+    p_avg    = df_src.groupby("month")["p_das"].mean()
 
-        # Band Q10–Q90
-        fig.add_trace(go.Scatter(
-            x=list(df_ann["date"]) + list(df_ann["date"])[::-1],
-            y=list(df_ann["q90"]) + list(df_ann["q10"])[::-1],
-            fill="toself",
-            fillcolor="rgba(255,165,0,0.15)",
-            line=dict(color="rgba(0,0,0,0)"),
-            name="Interval Q10–Q90",
-            hoverinfo="skip",
-        ), row=2, col=1)
+    q10_sc = q10_hist * multiplier
+    q50_sc = q50_hist * multiplier
+    q90_sc = q90_hist * multiplier
+    p_sc_m = p_avg * multiplier
 
-        # Q90
-        fig.add_trace(go.Scatter(
-            x=df_ann["date"], y=df_ann["q90"],
-            mode="lines", name="Q90 — Basah",
-            line=dict(color="#1565C0", width=1.5, dash="dash"),
-        ), row=2, col=1)
+    # Operable days per month from the same source
+    df_src = df_src.copy()
+    df_src["operable"] = ((df_src["q_total"] * multiplier) >= Q_MIN_UNIT).astype(int)
+    if is_historical:
+        avg_op = df_src.groupby("month")["operable"].sum().rename(target_year).round(1)
+    else:
+        monthly_op = df_src.groupby(["year", "month"])["operable"].sum().reset_index()
+        avg_op = monthly_op.groupby("month")["operable"].mean().round(1)
 
-        # Q50
-        fig.add_trace(go.Scatter(
-            x=df_ann["date"], y=df_ann["q50"],
-            mode="lines", name="Q50 — Normal",
-            line=dict(color="#2E7D32", width=2.5),
-        ), row=2, col=1)
+    month_names = [pd.Timestamp(2000, m, 1).strftime("%b") for m in range(1, 13)]
 
-        # Q10
-        fig.add_trace(go.Scatter(
-            x=df_ann["date"], y=df_ann["q10"],
-            mode="lines", name="Q10 — Kering",
-            line=dict(color="#B71C1C", width=1.5, dash="dot"),
-        ), row=2, col=1)
+    # ------------------------------------------------------------------
+    # Chart: rainfall (top) + Q climatology bar (bottom)
+    # ------------------------------------------------------------------
+    from plotly.subplots import make_subplots as _msp
+    fig = _msp(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.25, 0.75],
+        vertical_spacing=0.05,
+        subplot_titles=(
+            "Rata-rata P_DAS per Bulan (mm)",
+            f"{'Data Aktual' if is_historical else 'Klimatologi'} Inflow Q per Bulan — Skenario {scenario.upper()}",
+        ),
+    )
 
-        fig.update_layout(
-            title=dict(
-                text=f"Simulasi Inflow Tahunan {target_year} — Skenario: {scenario.upper()}",
-                font=dict(size=15),
-            ),
-            height=560,
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            legend=dict(
-                orientation="h",
-                yanchor="bottom", y=-0.18,
-                xanchor="center", x=0.5,
-                bgcolor="rgba(255,255,255,0.9)",
-                bordercolor="#cccccc", borderwidth=1,
-                font=dict(size=12),
-            ),
-            margin=dict(l=10, r=10, t=60, b=10),
-        )
-        fig.update_yaxes(title_text="P_DAS (mm)", gridcolor="#eeeeee", row=1, col=1)
-        fig.update_yaxes(title_text="Q (m³/s)", rangemode="tozero", gridcolor="#eeeeee", row=2, col=1)
-        fig.update_xaxes(showgrid=False, tickformat="%b '%y", row=2, col=1)
-        st.plotly_chart(fig, use_container_width=True)
+    fig.add_trace(go.Bar(
+        x=month_names, y=p_sc_m.values,
+        name="P_DAS (mm)", marker_color="#4C9BE8",
+        marker_line_color="#1a6bbf", marker_line_width=0.8,
+    ), row=1, col=1)
 
-        # ---------------------------------------------------------------
-        # Chart: monthly average bar chart
-        # ---------------------------------------------------------------
+    fig.add_trace(go.Bar(
+        x=month_names, y=q50_sc.values,
+        name="Q50 — Median",
+        marker_color="#2ca02c",
+        error_y=dict(
+            type="data", symmetric=False,
+            array=(q90_sc - q50_sc).values,
+            arrayminus=(q50_sc - q10_sc).values,
+            visible=True, color="#555555",
+        ),
+    ), row=2, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=month_names, y=q10_sc.values,
+        mode="lines+markers", name="Q10 — Kering",
+        line=dict(color="#B71C1C", width=1.5, dash="dot"),
+        marker=dict(size=6),
+    ), row=2, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=month_names, y=q90_sc.values,
+        mode="lines+markers", name="Q90 — Basah",
+        line=dict(color="#1565C0", width=1.5, dash="dash"),
+        marker=dict(size=6),
+    ), row=2, col=1)
+
+    fig.update_layout(
+        title=dict(
+            text=f"{'Data Aktual' if is_historical else 'Klimatologi'} Inflow {target_year} — Skenario {scenario.upper()}",
+            font=dict(size=15),
+        ),
+        height=560,
+        plot_bgcolor="white", paper_bgcolor="white",
+        legend=dict(
+            orientation="h", yanchor="bottom", y=-0.18,
+            xanchor="center", x=0.5,
+            bgcolor="rgba(255,255,255,0.9)",
+            bordercolor="#cccccc", borderwidth=1, font=dict(size=12),
+        ),
+        margin=dict(l=10, r=10, t=60, b=10),
+    )
+    fig.update_yaxes(title_text="P_DAS (mm)", gridcolor="#eeeeee", row=1, col=1)
+    fig.update_yaxes(title_text="Q (m³/s)", rangemode="tozero", gridcolor="#eeeeee", row=2, col=1)
+    fig.update_xaxes(showgrid=False, row=2, col=1)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ------------------------------------------------------------------
+    # Monthly summary table
+    # ------------------------------------------------------------------
+    tbl = pd.DataFrame({
+        "Bulan":                    month_names,
+        "P_DAS (mm)":               p_sc_m.values.round(1),
+        "Q10 (m³/s)":               q10_sc.values.round(3),
+        "Q50 (m³/s)":               q50_sc.values.round(3),
+        "Q90 (m³/s)":               q90_sc.values.round(3),
+        "Hari Operasional (avg)":   avg_op.values,
+    })
+    st.subheader("Ringkasan per Bulan")
+    st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+    # ------------------------------------------------------------------
+    # Annual metrics
+    # ------------------------------------------------------------------
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Est. Hari Operasional/Tahun", f"{avg_op.sum():.0f} hari")
+    c2.metric("Rata-rata Q50 Tahunan", f"{q50_sc.mean():.3f} m³/s")
+    c3.metric("Q50 Puncak", f"{q50_sc.max():.2f} m³/s",
+              help=f"Bulan {month_names[int(q50_sc.values.argmax())]}")
+
+    csv = tbl.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download CSV Klimatologi",
+        data=csv,
+        file_name=f"klimatologi_{target_year}_{scenario}.csv",
+        mime="text/csv",
+    )
+
+    st.caption(
+        "Sumber: distribusi historis q_total 2014–2024 per bulan. "
+        "Skenario kering/basah mengalikan Q dengan faktor 0.70 / 1.30."
+    )
+
+    # ------------------------------------------------------------------
+    # Expand to daily for turbine section
+    # Historical years: use actual daily q_total so turbine counts match
+    # Future years: expand monthly quantiles to daily
+    # ------------------------------------------------------------------
+    if is_historical:
+        df_yr = df_c[df_c["year"] == target_year].sort_values("date").reset_index(drop=True)
+        df_ann = df_yr[["date"]].copy()
+        df_ann["q10"] = df_yr["q_total"].values * multiplier
+        df_ann["q50"] = df_yr["q_total"].values * multiplier
+        df_ann["q90"] = df_yr["q_total"].values * multiplier
+    else:
+        all_dates = pd.date_range(f"{target_year}-01-01", f"{target_year}-12-31", freq="D")
+        df_ann = pd.DataFrame({"date": all_dates})
         df_ann["month"] = df_ann["date"].dt.month
-        monthly = df_ann.groupby("month")[["q10","q50","q90"]].mean().reset_index()
-        monthly["month_name"] = monthly["month"].apply(
-            lambda m: pd.Timestamp(2000, m, 1).strftime("%b")
-        )
+        df_ann["q10"] = df_ann["month"].map(q10_sc)
+        df_ann["q50"] = df_ann["month"].map(q50_sc)
+        df_ann["q90"] = df_ann["month"].map(q90_sc)
 
-        fig2 = go.Figure()
-        fig2.add_trace(go.Bar(
-            x=monthly["month_name"], y=monthly["q50"],
-            name="Q50 — Normal",
-            marker_color="#2ca02c",
-            error_y=dict(
-                type="data",
-                symmetric=False,
-                array=(monthly["q90"] - monthly["q50"]).values,
-                arrayminus=(monthly["q50"] - monthly["q10"]).values,
-                visible=True,
-            ),
-        ))
-        fig2.update_layout(
-            title=f"Rata-rata Inflow per Bulan — {target_year} (error bar = Q10/Q90)",
-            xaxis_title="Bulan",
-            yaxis_title="Q (m³/s)",
-            height=380,
-        )
-        st.plotly_chart(fig2, use_container_width=True)
-
-        # ---------------------------------------------------------------
-        # Summary table per month
-        # ---------------------------------------------------------------
-        monthly_display = monthly.copy()
-        monthly_display.columns = ["Bulan No", "Q10 (m³/s)", "Q50 (m³/s)", "Q90 (m³/s)", "Bulan"]
-        monthly_display = monthly_display[["Bulan", "Q10 (m³/s)", "Q50 (m³/s)", "Q90 (m³/s)"]]
-        for col in ["Q10 (m³/s)", "Q50 (m³/s)", "Q90 (m³/s)"]:
-            monthly_display[col] = monthly_display[col].round(3)
-
-        st.subheader("Ringkasan per Bulan")
-        st.dataframe(monthly_display, use_container_width=True, hide_index=True)
-
-        # ---------------------------------------------------------------
-        # Statistik operasional turbin
-        # ---------------------------------------------------------------
-        Q_MIN_1_UNIT = 0.30 * 60.5
-        days_operable = (df_ann["q50"] >= Q_MIN_1_UNIT).sum()
-        st.subheader("Implikasi Operasional Turbin")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Hari Q50 >= min 1 unit", f"{days_operable} hari",
-                  help=f"Q minimum 1 unit = {Q_MIN_1_UNIT:.1f} m³/s")
-        c2.metric("Rata-rata Q50 tahunan", f"{df_ann['q50'].mean():.3f} m³/s")
-        c3.metric("Q50 maksimum", f"{df_ann['q50'].max():.2f} m³/s",
-                  help=f"Terjadi pada {df_ann.loc[df_ann['q50'].idxmax(), 'date'].strftime('%d %b %Y')}")
-
-        # Download
-        csv = df_ann.drop(columns=["step","month"], errors="ignore").to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download hasil simulasi CSV",
-            data=csv,
-            file_name=f"annual_forecast_{target_year}_{scenario}.csv",
-            mime="text/csv",
-        )
-
-        st.caption(
-            "Catatan: prediksi rolling mengakumulasi error semakin jauh ke depan. "
-            "Akurasi paling tinggi di bulan Jan–Feb, menurun di akhir tahun. "
-            "P_DAS yang digunakan adalah klimatologi historis — bukan prakiraan cuaca nyata."
-        )
-
-        # ---------------------------------------------------------------
-        # Turbine performance — tahunan
-        # ---------------------------------------------------------------
-        st.divider()
-        st.subheader(f"Performa Turbin — Tahun {target_year}")
-        ann_dates = df_ann["date"].dt.strftime("%Y-%m-%d").tolist()
-        render_turbine_section(
-            ann_dates,
-            q10=df_ann["q10"].tolist(),
-            q50=df_ann["q50"].tolist(),
-            q90=df_ann["q90"].tolist(),
-            label=f"(Tahun {target_year} — Skenario {scenario.upper()})",
-        )
+    st.divider()
+    st.subheader(f"Performa Turbin — Tahun {target_year}")
+    render_turbine_section(
+        df_ann["date"].dt.strftime("%Y-%m-%d").tolist(),
+        q10=df_ann["q10"].tolist(),
+        q50=df_ann["q50"].tolist(),
+        q90=df_ann["q90"].tolist(),
+        label=f"(Tahun {target_year} — Skenario {scenario.upper()})",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1422,7 +1424,7 @@ def main():
     with tab3:
         page_monthly(df, model, q_scaler)
     with tab4:
-        page_annual(df, model)
+        page_annual(df)
     with tab5:
         page_analysis(model, q_scaler)
 
