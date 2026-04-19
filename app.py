@@ -1410,11 +1410,13 @@ def main():
 
     render_sidebar(df)
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    # To restore Simulasi Tahunan: uncomment the 3 lines marked [ANNUAL]
+    # and change tab1,tab2,tab3,tab4 → tab1,tab2,tab3,tab4,tab5
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📈 Historical Data",
         "🔮 7-Day Forecast",
         "📆 30-Day Forecast",
-        "📅 Simulasi Tahunan",
+        # "📅 Simulasi Tahunan",  # [ANNUAL]
         "📊 Analysis & Turbine Performance",
     ])
     with tab1:
@@ -1423,9 +1425,8 @@ def main():
         page_forecast(df, model, q_scaler)
     with tab3:
         page_monthly(df, model, q_scaler)
-    with tab4:
-        page_annual(df)
-    with tab5:
+    # with tab4: page_annual(df)  # [ANNUAL]
+    with tab4:  # change to tab5 when restoring [ANNUAL]
         page_analysis(model, q_scaler)
 
 
