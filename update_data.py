@@ -27,12 +27,23 @@ RAINFALL_DATA = {
 }
 # ---------------------------------------------------------------------------
 
-# SCS-CN parameter (sama dengan PERHITUNGAN.xlsx)
-CN         = 80
-S          = (25400 / CN) - 254   # 63.5 mm
-Ia         = 0.2 * S              # 12.7 mm
-LUAS_DAS   = 700e6                # 700 km² dalam m²
-Q_BASEFLOW = 3.92918              # m³/s (konstan)
+# SCS-CN parameter (dari PERHITUNGAN_v2.xlsx — SCS-CN sheet & LUAS DAERAH sheet)
+CN         = 76.46
+S          = (25400 / CN) - 254   # 78.1998 mm
+Ia         = 0.2 * S              # 15.64 mm
+LUAS_DAS   = 127.86e6             # 127.86 km² dalam m² (luas efektif DAS)
+Q_BASEFLOW = 1.02111226           # m³/s (konstan, dari HUJAN WILAYAH DAS sheet)
+
+# Bobot Thiessen (dari LUAS DAERAH sheet — Wi = Ai / A_total)
+# Urutan: [pacitan, nawangan, kebonagung, bandar, tegalombo, tulakan]
+_THIESSEN_WEIGHTS = [
+    77.11  / 754.24,   # pacitan
+    124.06 / 754.24,   # nawangan
+    124.85 / 754.24,   # kebonagung
+    117.34 / 754.24,   # bandar
+    149.26 / 754.24,   # tegalombo
+    161.62 / 754.24,   # tulakan
+]
 
 CSV_PATH = os.path.join(os.path.dirname(__file__), "data_grindulu.csv")
 
@@ -46,7 +57,7 @@ def scs_cn(p_das):
 
 def compute_row(date_str, stations):
     """Hitung semua kolom dari data hujan stasiun."""
-    p_das     = np.mean(stations)
+    p_das     = np.dot(stations, _THIESSEN_WEIGHTS)
     pe        = scs_cn(p_das)
     q_runoff  = (pe / 1000) * LUAS_DAS / 86400   # m³/s
     q_total   = q_runoff + Q_BASEFLOW

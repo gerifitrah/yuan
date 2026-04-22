@@ -67,140 +67,187 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------------------------
-# Turbine calculation constants (PLTA Grindulu specs)
+# PLTA Grindulu PS — Pumped Storage specs (OPSI-1A)
 # ---------------------------------------------------------------------------
 
-H_NET       = 486.5     # m
-Q_DESIGN    = 60.5      # m³/s per unit
-N_UNITS     = 4
-ETA_T_MAX   = 0.90
-ETA_G       = 0.96
-RHO         = 1000.0
-G_GRAV      = 9.81
-Q_MIN_UNIT  = 0.30 * Q_DESIGN   # 18.15 m³/s minimum per unit
+H_NET         = 486.5        # m  net head
+Q_DESIGN      = 60.5         # m³/s per unit (turbine mode)
+N_UNITS       = 4
+ETA_T_MAX     = 0.90         # max turbine efficiency
+ETA_G         = 0.96         # generator efficiency
+ETA_PUMP      = 0.85         # pump mode efficiency (Francis reversible)
+RHO           = 1000.0
+G_GRAV        = 9.81
+
+# Reservoir capacities — OPSI-1A
+VOL_UPPER_MAX = 7_900_000    # m³  upper reservoir (7.90 juta m³)
+VOL_LOWER_MAX = 8_990_000    # m³  lower reservoir (8.99 juta m³)
+
+# Derived operational parameters
+Q_TURBINE     = N_UNITS * Q_DESIGN   # 242 m³/s  total turbine flow
+P_RATED_MW    = N_UNITS * 250.0      # 1000 MW   total rated power
+HOURS_GEN     = 8                    # h/day  peak generation
+HOURS_PUMP    = 16                   # h/day  off-peak pumping
+ETA_LOSS_FRAC = 0.03                 # 3% reservoir losses per cycle (evap+seepage)
 
 
-def _eta_turbine(q_per_unit: float) -> float:
-    """Francis turbine efficiency as function of Q/Q_design."""
-    q_ratio = q_per_unit / Q_DESIGN
-    eta = ETA_T_MAX * (1 - 0.28 * (q_ratio - 1.0) ** 2)
-    return float(np.clip(eta, 0.0, ETA_T_MAX))
+def simulate_ps_day(
+    q_inflow: float,
+    vol_upper: float,
+    vol_lower: float,
+    hours_gen: int = HOURS_GEN,
+) -> dict:
+    """Simulate one day of pumped storage operation.
 
-
-def calc_turbine(q_total: float) -> dict:
+    Cycle order:
+      1. Night pump (off-peak, 16 h): lower reservoir -> upper reservoir
+      2. Day generation (peak, hours_gen h): upper -> lower
+      3. River inflow: adds to lower reservoir
+      4. Losses: evaporation + seepage (ETA_LOSS_FRAC of generated volume)
     """
-    Given total available inflow Q (m³/s), calculate:
-      - n_units  : number of active generating units
-      - q_unit   : flow per unit (m³/s)
-      - eta_t    : turbine efficiency at this operating point
-      - power_mw : total power output (MW)
-      - energy_mwh: daily energy (MWh = MW × 24 h)
+    # 1. Pumping phase
+    vol_needed   = VOL_UPPER_MAX - vol_upper
+    vol_pump_cap = Q_TURBINE * HOURS_PUMP * 3600
+    vol_pump     = min(vol_lower, vol_needed, vol_pump_cap)
+    vol_upper    = vol_upper + vol_pump
+    vol_lower    = vol_lower - vol_pump
 
-    Unit commitment: maximise active units up to N_UNITS,
-    each unit gets equal share, minimum Q_MIN_UNIT each.
-    """
-    if q_total < Q_MIN_UNIT:
-        return {"n_units": 0, "q_unit": 0.0, "eta_t": 0.0,
-                "power_mw": 0.0, "energy_mwh": 0.0}
+    # 2. Generation phase
+    vol_max_gen = Q_TURBINE * hours_gen * 3600
+    vol_gen     = min(vol_upper, vol_max_gen)
+    actual_h    = vol_gen / (Q_TURBINE * 3600)
+    energy_mwh  = P_RATED_MW * actual_h
+    vol_upper   = vol_upper - vol_gen
+    vol_lower   = min(vol_lower + vol_gen, VOL_LOWER_MAX)
 
-    # How many units can run?
-    n = min(int(q_total / Q_MIN_UNIT), N_UNITS)
-    q_per_unit = min(q_total / n, Q_DESIGN)
-    eta_t      = _eta_turbine(q_per_unit)
-    power_mw   = n * RHO * G_GRAV * q_per_unit * H_NET * eta_t * ETA_G / 1e6
+    # 3. River inflow
+    vol_lower = min(vol_lower + q_inflow * 86400, VOL_LOWER_MAX)
+
+    # 4. Losses
+    vol_lower = max(vol_lower - vol_gen * ETA_LOSS_FRAC, 0.0)
 
     return {
-        "n_units":    n,
-        "q_unit":     round(q_per_unit, 3),
-        "eta_t":      round(eta_t * 100, 2),       # in %
-        "power_mw":   round(power_mw, 2),
-        "energy_mwh": round(power_mw * 24, 1),
+        "vol_upper":  vol_upper,
+        "vol_lower":  vol_lower,
+        "hours_gen":  round(actual_h, 2),
+        "energy_mwh": round(energy_mwh, 1),
+        "power_mw":   round(P_RATED_MW if actual_h > 0 else 0.0, 1),
+        "upper_pct":  round(vol_upper / VOL_UPPER_MAX * 100, 1),
+        "lower_pct":  round(vol_lower / VOL_LOWER_MAX * 100, 1),
     }
 
 
-def turbine_series(q_array: list | np.ndarray) -> pd.DataFrame:
-    """Apply calc_turbine to an array of Q values, return DataFrame."""
-    rows = [calc_turbine(float(q)) for q in q_array]
+def simulate_ps_series(
+    q_array,
+    vol_upper_init_pct: float = 90.0,
+    hours_gen: int = HOURS_GEN,
+) -> pd.DataFrame:
+    """Run daily pumped storage simulation over a Q inflow time series."""
+    vol_upper = VOL_UPPER_MAX * vol_upper_init_pct / 100
+    vol_lower = VOL_LOWER_MAX * 0.50
+
+    rows = []
+    for q in q_array:
+        result    = simulate_ps_day(float(q), vol_upper, vol_lower, hours_gen)
+        vol_upper = result["vol_upper"]
+        vol_lower = result["vol_lower"]
+        rows.append(result)
+
     return pd.DataFrame(rows)
 
 
-def render_turbine_section(
+def render_ps_section(
     date_strs: list,
-    q10: list, q50: list, q90: list,
+    q10: list,
+    q50: list,
+    q90: list,
     label: str = "",
+    key_prefix: str = "ps",
 ):
-    """Render turbine performance chart + table for a forecast result."""
+    """Render pumped storage performance chart + summary for a forecast."""
     from plotly.subplots import make_subplots as _msp
 
-    t10 = turbine_series(q10)
-    t50 = turbine_series(q50)
-    t90 = turbine_series(q90)
+    with st.expander("Pengaturan Awal Reservoir", expanded=False):
+        init_pct = st.slider(
+            "Level awal upper reservoir (%)",
+            min_value=10, max_value=100, value=90, step=5,
+            key=f"{key_prefix}_init",
+        )
 
-    # ---------------------------------------------------------------
-    # Chart: power output + unit count
-    # ---------------------------------------------------------------
+    ps10 = simulate_ps_series(q10, init_pct)
+    ps50 = simulate_ps_series(q50, init_pct)
+    ps90 = simulate_ps_series(q90, init_pct)
+
+    rated_energy = P_RATED_MW * HOURS_GEN
+
     fig = _msp(
         rows=2, cols=1,
         shared_xaxes=True,
-        row_heights=[0.60, 0.40],
+        row_heights=[0.55, 0.45],
         vertical_spacing=0.08,
         subplot_titles=(
-            f"Daya Terbangkit (MW) {label}",
-            "Jumlah Unit Turbin Aktif",
+            f"Energi Terbangkit (MWh) {label}",
+            "Level Upper Reservoir (%)",
         ),
     )
 
-    # Power bars — Q50 (solid), Q10/Q90 error
+    # Energy output
     fig.add_trace(go.Bar(
-        x=date_strs, y=t50["power_mw"],
-        name="Daya Q50 — Normal",
+        x=date_strs, y=ps50["energy_mwh"],
+        name="Energi Q50 — Normal",
         marker_color="#2E7D32",
         marker_line_color="#1B5E20",
         marker_line_width=1,
-        error_y=dict(
-            type="data", symmetric=False,
-            array=(t90["power_mw"] - t50["power_mw"]).clip(lower=0).tolist(),
-            arrayminus=(t50["power_mw"] - t10["power_mw"]).clip(lower=0).tolist(),
-            visible=True, color="#555555",
-        ),
     ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
-        x=date_strs, y=t90["power_mw"],
-        mode="lines", name="Daya Q90 — Basah",
+        x=date_strs, y=ps90["energy_mwh"],
+        mode="lines", name="Energi Q90 — Basah",
         line=dict(color="#1565C0", width=1.5, dash="dash"),
     ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
-        x=date_strs, y=t10["power_mw"],
-        mode="lines", name="Daya Q10 — Kering",
+        x=date_strs, y=ps10["energy_mwh"],
+        mode="lines", name="Energi Q10 — Kering",
         line=dict(color="#B71C1C", width=1.5, dash="dot"),
     ), row=1, col=1)
 
-    # Rated capacity line
     fig.add_hline(
-        y=N_UNITS * 250, line_dash="dot", line_color="gray",
-        annotation_text="Kapasitas penuh 1000 MW",
+        y=rated_energy, line_dash="dot", line_color="gray",
+        annotation_text=f"Kapasitas penuh {rated_energy:,.0f} MWh/hari",
         annotation_position="top left",
         row=1, col=1,
     )
 
-    # Unit count bar
-    colors_unit = {0: "#eeeeee", 1: "#FFF9C4", 2: "#FFE082",
-                   3: "#FFB300", 4: "#E65100"}
-    unit_colors = [colors_unit.get(int(n), "#cccccc") for n in t50["n_units"]]
-    fig.add_trace(go.Bar(
-        x=date_strs, y=t50["n_units"],
-        name="Jumlah unit (Q50)",
-        marker_color=unit_colors,
-        marker_line_color="#999999",
-        marker_line_width=0.8,
-        text=t50["n_units"].astype(str),
-        textposition="inside",
+    # Reservoir level
+    fig.add_trace(go.Scatter(
+        x=date_strs, y=ps50["upper_pct"],
+        mode="lines", name="Level Reservoir (Q50)",
+        line=dict(color="#2ca02c", width=2),
+        fill="tozeroy", fillcolor="rgba(44,160,44,0.15)",
     ), row=2, col=1)
 
+    fig.add_trace(go.Scatter(
+        x=date_strs, y=ps90["upper_pct"],
+        mode="lines", name="Level Q90",
+        line=dict(color="#1565C0", width=1.2, dash="dash"),
+    ), row=2, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=date_strs, y=ps10["upper_pct"],
+        mode="lines", name="Level Q10",
+        line=dict(color="#B71C1C", width=1.2, dash="dot"),
+    ), row=2, col=1)
+
+    fig.add_hline(
+        y=20, line_dash="dot", line_color="#FF6600",
+        annotation_text="Batas aman 20%",
+        annotation_position="top right",
+        row=2, col=1,
+    )
+
     fig.update_layout(
-        height=480,
+        height=500,
         plot_bgcolor="white", paper_bgcolor="white",
         legend=dict(
             orientation="h", yanchor="bottom", y=-0.22,
@@ -211,45 +258,36 @@ def render_turbine_section(
         ),
         margin=dict(l=10, r=10, t=50, b=10),
     )
-    fig.update_yaxes(title_text="Daya (MW)", gridcolor="#eeeeee",
+    fig.update_yaxes(title_text="Energi (MWh)", gridcolor="#eeeeee",
                      rangemode="tozero", row=1, col=1)
-    fig.update_yaxes(title_text="Unit aktif", gridcolor="#eeeeee",
-                     range=[-0.2, N_UNITS + 0.5], dtick=1, row=2, col=1)
+    fig.update_yaxes(title_text="Level (%)", gridcolor="#eeeeee",
+                     range=[0, 105], row=2, col=1)
     fig.update_xaxes(showgrid=False, tickangle=-30, row=2, col=1)
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # ---------------------------------------------------------------
-    # Summary metrics (Q50 basis)
-    # ---------------------------------------------------------------
-    total_energy = t50["energy_mwh"].sum()
-    max_power    = t50["power_mw"].max()
-    operable     = (t50["power_mw"] > 0).sum()
-    avg_units    = t50["n_units"].mean()
+    # Metrics
+    total_energy = ps50["energy_mwh"].sum()
+    avg_hours    = ps50["hours_gen"].mean()
+    days_full    = (ps50["energy_mwh"] >= rated_energy * 0.99).sum()
+    min_level    = ps50["upper_pct"].min()
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Energi (Q50)", f"{total_energy:,.0f} MWh")
-    c2.metric("Daya Puncak (Q50)",  f"{max_power:.1f} MW")
-    c3.metric("Hari Bisa Bangkit",  f"{operable} hari",
-              help=f"dari {len(date_strs)} hari total")
-    c4.metric("Rata-rata Unit Aktif", f"{avg_units:.1f} unit")
+    c1.metric("Total Energi (Q50)",         f"{total_energy:,.0f} MWh")
+    c2.metric("Rata-rata Jam Bangkit/Hari",  f"{avg_hours:.1f} jam")
+    c3.metric("Hari Kapasitas Penuh",        f"{days_full} hari")
+    c4.metric("Level Reservoir Min",         f"{min_level:.1f}%")
 
-    # ---------------------------------------------------------------
-    # Tabel detail
-    # ---------------------------------------------------------------
-    with st.expander("Tabel Detail Turbin per Hari", expanded=False):
+    with st.expander("Tabel Detail Pumped Storage per Hari", expanded=False):
         tbl = pd.DataFrame({
-            "Tanggal":              date_strs,
-            "Q10 (m³/s)":          np.round(q10, 3),
-            "Q50 (m³/s)":          np.round(q50, 3),
-            "Q90 (m³/s)":          np.round(q90, 3),
-            "Unit Aktif (Q50)":    t50["n_units"].astype(int),
-            "Q/unit (m³/s)":       t50["q_unit"],
-            "Eff. Turbin (%)":     t50["eta_t"],
-            "Daya Q10 (MW)":       t10["power_mw"],
-            "Daya Q50 (MW)":       t50["power_mw"],
-            "Daya Q90 (MW)":       t90["power_mw"],
-            "Energi Harian (MWh)": t50["energy_mwh"],
+            "Tanggal":             date_strs,
+            "Q50 Inflow (m³/s)":   np.round(q50, 3),
+            "Jam Bangkit (Q50)":   ps50["hours_gen"],
+            "Energi Q50 (MWh)":    ps50["energy_mwh"],
+            "Energi Q10 (MWh)":    ps10["energy_mwh"],
+            "Energi Q90 (MWh)":    ps90["energy_mwh"],
+            "Upper Reservoir (%)": ps50["upper_pct"],
+            "Lower Reservoir (%)": ps50["lower_pct"],
         })
         st.dataframe(tbl, use_container_width=True, hide_index=True)
 
@@ -536,6 +574,8 @@ def page_forecast(df: pd.DataFrame, model: Seq2SeqQuantile | None, q_scaler):
     # ------------------------------------------------------------------
     # Run prediction
     # ------------------------------------------------------------------
+    _fc7_key = f"fc7_{ref_date}"
+
     if st.button("▶ Run Forecast", type="primary"):
         try:
             p_hist = edited_lb["p_das"].astype(float).values
@@ -547,16 +587,18 @@ def page_forecast(df: pd.DataFrame, model: Seq2SeqQuantile | None, q_scaler):
                 return
 
             preds = predict(model, p_hist, q_hist, p_fore, q_scaler)
-            # preds: (7, 3) — [q10, q50, q90]
-
-            _show_forecast_results(preds, forecast_dates, p_fore, actual_q)
+            st.session_state[_fc7_key] = dict(preds=preds, p_fore=p_fore, actual_q=actual_q)
 
         except Exception as e:
             st.error(f"Prediction failed: {e}")
             raise
 
+    if _fc7_key in st.session_state:
+        s = st.session_state[_fc7_key]
+        _show_forecast_results(s["preds"], forecast_dates, s["p_fore"], s["actual_q"], df=df)
 
-def _show_forecast_results(preds: np.ndarray, dates, p_fore: np.ndarray, actual_q=None):
+
+def _show_forecast_results(preds: np.ndarray, dates, p_fore: np.ndarray, actual_q=None, df=None):
     """Render the forecast chart and summary table."""
     from plotly.subplots import make_subplots
 
@@ -676,8 +718,60 @@ def _show_forecast_results(preds: np.ndarray, dates, p_fore: np.ndarray, actual_
     st.plotly_chart(fig, use_container_width=True)
 
     # ------------------------------------------------------------------
-    # Summary table
+    # Metric cards ringkasan
     # ------------------------------------------------------------------
+    total_vol  = float(preds[:, 1].sum()) * 86400 / 1_000_000  # juta m³
+    peak_q50   = float(preds[:, 1].max())
+    avg_q50    = float(preds[:, 1].mean())
+    avg_width  = float((preds[:, 2] - preds[:, 0]).mean())
+    peak_day   = date_strs[int(preds[:, 1].argmax())]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Volume Inflow (Q50)", f"{total_vol:.3f} juta m³")
+    c2.metric("Q50 Puncak", f"{peak_q50:.2f} m³/s", help=f"Hari: {peak_day}")
+    c3.metric("Rata-rata Q50", f"{avg_q50:.3f} m³/s")
+    c4.metric("Rata-rata Lebar Interval", f"{avg_width:.3f} m³/s",
+              help="Q90 - Q10: makin lebar = makin tidak pasti")
+
+    # ------------------------------------------------------------------
+    # Konteks historis
+    # ------------------------------------------------------------------
+    if df is not None:
+        forecast_months = set(d.month for d in dates)
+        hist_same_month = df[df["date"].dt.month.isin(forecast_months)]["q_total"]
+        hist_avg  = float(hist_same_month.mean())
+        hist_p10  = float(hist_same_month.quantile(0.10))
+        hist_p90  = float(hist_same_month.quantile(0.90))
+        delta_pct = (avg_q50 - hist_avg) / hist_avg * 100
+        arah      = "di atas" if delta_pct >= 0 else "di bawah"
+        st.caption(
+            f"Rata-rata Q50 forecast **{avg_q50:.3f} m³/s** — "
+            f"**{abs(delta_pct):.1f}% {arah}** rata-rata historis bulan yang sama "
+            f"({hist_avg:.3f} m³/s | rentang normal: {hist_p10:.3f}–{hist_p90:.3f} m³/s, 2014–2024)."
+        )
+
+    # ------------------------------------------------------------------
+    # Summary table + kolom Kondisi
+    # ------------------------------------------------------------------
+    if df is not None:
+        df_tmp     = df.copy()
+        df_tmp["_m"] = df_tmp["date"].dt.month
+        p10_m = df_tmp.groupby("_m")["q_total"].quantile(0.10)
+        p90_m = df_tmp.groupby("_m")["q_total"].quantile(0.90)
+        kondisi = []
+        for i, d in enumerate(dates):
+            q   = float(preds[i, 1])
+            p10 = float(p10_m.get(d.month, 0.0))
+            p90 = float(p90_m.get(d.month, 1e9))
+            if q < p10:
+                kondisi.append("Kering")
+            elif q > p90:
+                kondisi.append("Basah")
+            else:
+                kondisi.append("Normal")
+    else:
+        kondisi = ["—"] * len(date_strs)
+
     actual_col = [f"{v:.3f}" if v is not None else "—"
                   for v in (actual_q or [None] * len(date_strs))]
 
@@ -687,6 +781,7 @@ def _show_forecast_results(preds: np.ndarray, dates, p_fore: np.ndarray, actual_
         "Q10 — Kering (m³/s)":  preds[:, 0].round(3),
         "Q50 — Normal (m³/s)":  preds[:, 1].round(3),
         "Q90 — Basah (m³/s)":   preds[:, 2].round(3),
+        "Kondisi":              kondisi,
         "Aktual (m³/s)":        actual_col,
     })
     st.subheader("Tabel Prediksi")
@@ -717,16 +812,17 @@ def _show_forecast_results(preds: np.ndarray, dates, p_fore: np.ndarray, actual_
     )
 
     # ---------------------------------------------------------------
-    # Turbine performance section
+    # Pumped storage performance section
     # ---------------------------------------------------------------
     st.divider()
-    st.subheader("Performa Turbin — 7 Hari")
-    render_turbine_section(
+    st.subheader("Simulasi Pumped Storage — 7 Hari")
+    render_ps_section(
         date_strs,
         q10=preds[:, 0].tolist(),
         q50=preds[:, 1].tolist(),
         q90=preds[:, 2].tolist(),
         label="(7 Hari ke Depan)",
+        key_prefix="fc7",
     )
 
 
@@ -793,12 +889,12 @@ def page_annual(df: pd.DataFrame):
 
     # Operable days per month from the same source
     df_src = df_src.copy()
-    df_src["operable"] = ((df_src["q_total"] * multiplier) >= Q_MIN_UNIT).astype(int)
+    df_src["inflow_vol"] = df_src["q_total"] * multiplier * 86400 / 1_000_000  # juta m³/hari
     if is_historical:
-        avg_op = df_src.groupby("month")["operable"].sum().rename(target_year).round(1)
+        avg_op = df_src.groupby("month")["inflow_vol"].mean().rename(target_year).round(3)
     else:
-        monthly_op = df_src.groupby(["year", "month"])["operable"].sum().reset_index()
-        avg_op = monthly_op.groupby("month")["operable"].mean().round(1)
+        monthly_vol = df_src.groupby(["year", "month"])["inflow_vol"].mean().reset_index()
+        avg_op = monthly_vol.groupby("month")["inflow_vol"].mean().round(3)
 
     month_names = [pd.Timestamp(2000, m, 1).strftime("%b") for m in range(1, 13)]
 
@@ -873,12 +969,12 @@ def page_annual(df: pd.DataFrame):
     # Monthly summary table
     # ------------------------------------------------------------------
     tbl = pd.DataFrame({
-        "Bulan":                    month_names,
-        "P_DAS (mm)":               p_sc_m.values.round(1),
-        "Q10 (m³/s)":               q10_sc.values.round(3),
-        "Q50 (m³/s)":               q50_sc.values.round(3),
-        "Q90 (m³/s)":               q90_sc.values.round(3),
-        "Hari Operasional (avg)":   avg_op.values,
+        "Bulan":                        month_names,
+        "P_DAS (mm)":                   p_sc_m.values.round(1),
+        "Q10 (m³/s)":                   q10_sc.values.round(3),
+        "Q50 (m³/s)":                   q50_sc.values.round(3),
+        "Q90 (m³/s)":                   q90_sc.values.round(3),
+        "Rata-rata Inflow (juta m³/hr)": avg_op.values,
     })
     st.subheader("Ringkasan per Bulan")
     st.dataframe(tbl, use_container_width=True, hide_index=True)
@@ -887,7 +983,7 @@ def page_annual(df: pd.DataFrame):
     # Annual metrics
     # ------------------------------------------------------------------
     c1, c2, c3 = st.columns(3)
-    c1.metric("Est. Hari Operasional/Tahun", f"{avg_op.sum():.0f} hari")
+    c1.metric("Total Inflow Tahunan (Q50)", f"{avg_op.sum():.2f} juta m³")
     c2.metric("Rata-rata Q50 Tahunan", f"{q50_sc.mean():.3f} m³/s")
     c3.metric("Q50 Puncak", f"{q50_sc.max():.2f} m³/s",
               help=f"Bulan {month_names[int(q50_sc.values.argmax())]}")
@@ -925,19 +1021,133 @@ def page_annual(df: pd.DataFrame):
         df_ann["q90"] = df_ann["month"].map(q90_sc)
 
     st.divider()
-    st.subheader(f"Performa Turbin — Tahun {target_year}")
-    render_turbine_section(
+    st.subheader(f"Simulasi Pumped Storage — Tahun {target_year}")
+    render_ps_section(
         df_ann["date"].dt.strftime("%Y-%m-%d").tolist(),
         q10=df_ann["q10"].tolist(),
         q50=df_ann["q50"].tolist(),
         q90=df_ann["q90"].tolist(),
         label=f"(Tahun {target_year} — Skenario {scenario.upper()})",
+        key_prefix="ann",
     )
 
 
 # ---------------------------------------------------------------------------
 # Page: 30-Day Forecast
 # ---------------------------------------------------------------------------
+
+def _show_monthly_results(date_strs, p_fore_all, all_q10, all_q50, all_q90, actual_q, ref_date, end_date):
+    """Render 30-day forecast results. Called outside button block so slider persists."""
+    from plotly.subplots import make_subplots as _msp2
+    has_act = any(v is not None for v in actual_q)
+
+    fig = _msp2(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.25, 0.75],
+        vertical_spacing=0.05,
+        subplot_titles=(
+            "Curah Hujan P_DAS (mm)",
+            "Prediksi Inflow Q (m³/s) — 30 Hari",
+        ),
+    )
+    fig.add_trace(go.Bar(
+        x=date_strs, y=p_fore_all.tolist(),
+        name="P_DAS (mm)", marker_color="#4C9BE8",
+        marker_line_color="#1a6bbf", marker_line_width=0.8,
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=date_strs + date_strs[::-1],
+        y=all_q90 + all_q10[::-1],
+        fill="toself", fillcolor="rgba(255,165,0,0.15)",
+        line=dict(color="rgba(0,0,0,0)"), name="Interval Q10–Q90", hoverinfo="skip",
+    ), row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=date_strs, y=all_q90,
+        mode="lines", name="Q90 — Basah",
+        line=dict(color="#1565C0", width=2, dash="dash"),
+    ), row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=date_strs, y=all_q50,
+        mode="lines+markers", name="Q50 — Normal",
+        line=dict(color="#2E7D32", width=3),
+        marker=dict(size=6, color="#2E7D32", line=dict(color="white", width=1)),
+    ), row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=date_strs, y=all_q10,
+        mode="lines", name="Q10 — Kering",
+        line=dict(color="#B71C1C", width=2, dash="dot"),
+    ), row=2, col=1)
+    if has_act:
+        fig.add_trace(go.Scatter(
+            x=date_strs,
+            y=[v if v is not None else None for v in actual_q],
+            mode="lines+markers", name="Aktual (observed)",
+            line=dict(color="#000000", width=2.5),
+            marker=dict(size=7, symbol="circle-open", color="#000000", line=dict(width=2)),
+        ), row=2, col=1)
+    fig.update_layout(
+        title=dict(
+            text=f"Prediksi Inflow 30 Hari — {ref_date.strftime('%d %B %Y')} s.d. {end_date.strftime('%d %B %Y')}",
+            font=dict(size=15),
+        ),
+        height=580, plot_bgcolor="white", paper_bgcolor="white",
+        legend=dict(
+            orientation="h", yanchor="bottom", y=-0.20, xanchor="center", x=0.5,
+            bgcolor="rgba(255,255,255,0.9)", bordercolor="#cccccc", borderwidth=1, font=dict(size=12),
+        ),
+        margin=dict(l=10, r=10, t=60, b=10),
+    )
+    fig.update_yaxes(title_text="P_DAS (mm)", gridcolor="#eeeeee", row=1, col=1)
+    fig.update_yaxes(title_text="Q (m³/s)", rangemode="tozero", gridcolor="#eeeeee", row=2, col=1)
+    fig.update_xaxes(showgrid=False, tickformat="%d %b", tickangle=-30, row=2, col=1)
+    st.plotly_chart(fig, use_container_width=True)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rata-rata Q50 Inflow", f"{np.mean(all_q50):.3f} m³/s")
+    c2.metric("Q50 Maksimum", f"{max(all_q50):.2f} m³/s",
+              help=f"Hari ke-{all_q50.index(max(all_q50))+1} ({date_strs[all_q50.index(max(all_q50))]})")
+    c3.metric("Q50 Minimum", f"{min(all_q50):.3f} m³/s")
+    total_vol = sum(q * 86400 / 1_000_000 for q in all_q50)
+    c4.metric("Total Volume Inflow (Q50)", f"{total_vol:.3f} juta m³")
+
+    if has_act:
+        obs = np.array([v for v in actual_q if v is not None])
+        pred_q50_match = np.array([all_q50[i] for i, v in enumerate(actual_q) if v is not None])
+        mae  = np.mean(np.abs(obs - pred_q50_match))
+        rmse = np.sqrt(np.mean((obs - pred_q50_match) ** 2))
+        st.info(f"Vs Aktual — MAE: **{mae:.3f} m³/s** | RMSE: **{rmse:.3f} m³/s**")
+
+    with st.expander("Tabel Prediksi Lengkap (30 hari)", expanded=False):
+        tbl = pd.DataFrame({
+            "Tanggal":             date_strs,
+            "P_DAS (mm)":          p_fore_all.round(1),
+            "Q10 — Kering (m³/s)": np.round(all_q10, 4),
+            "Q50 — Normal (m³/s)": np.round(all_q50, 4),
+            "Q90 — Basah (m³/s)":  np.round(all_q90, 4),
+            "Aktual (m³/s)":       [f"{v:.3f}" if v is not None else "—" for v in actual_q],
+        })
+        st.dataframe(tbl, use_container_width=True, hide_index=True)
+        csv = tbl.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download CSV", data=csv,
+            file_name=f"forecast_30hari_{ref_date.strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+        )
+
+    st.caption(
+        "Prediksi rolling: akurasi tertinggi di 7 hari pertama, "
+        "menurun di hari 8–30 karena prediksi sebelumnya dipakai sebagai look-back."
+    )
+    st.divider()
+    st.subheader("Simulasi Pumped Storage — 30 Hari")
+    render_ps_section(
+        date_strs,
+        q10=all_q10, q50=all_q50, q90=all_q90,
+        label="(30 Hari ke Depan)",
+        key_prefix="fc30",
+    )
+
 
 def page_monthly(df: pd.DataFrame, model, q_scaler):
     st.header("Prediksi Inflow 30 Hari ke Depan")
@@ -1044,29 +1254,26 @@ def page_monthly(df: pd.DataFrame, model, q_scaler):
     # ------------------------------------------------------------------
     # Rolling forecast 30 hari
     # ------------------------------------------------------------------
+    _fc30_key = f"fc30_{ref_date}"
+
     if st.button("▶ Prediksi 30 Hari", type="primary"):
         with st.spinner("Menghitung prediksi 30 hari..."):
             p_hist_arr = lb_edit["p_das"].astype(float).values
             q_hist_arr = lb_edit["q_total"].astype(float).values
             p_fore_all = fc_edit["P_DAS (mm)"].astype(float).values  # (30,)
 
-            # Rolling: 7 hari per step
             import pickle as _pk
             with open(FEATURE_SCALER, "rb") as f:
                 scalers = _pk.load(f)
-            p_sc = scalers["p_scaler"]
 
             p_buf = list(p_hist_arr)
             q_buf = list(q_hist_arr)
-
             all_q10, all_q50, all_q90 = [], [], []
             all_dates = [ref_date + pd.Timedelta(days=i) for i in range(30)]
 
             for step_start in range(0, 30, PRED_LEN):
                 step_end = min(step_start + PRED_LEN, 30)
                 p_fore_step = p_fore_all[step_start:step_end]
-
-                # Pad to PRED_LEN if last step is shorter
                 pad = PRED_LEN - len(p_fore_step)
                 p_fore_padded = np.pad(p_fore_step.astype(np.float32), (0, pad), mode="edge")
 
@@ -1075,7 +1282,6 @@ def page_monthly(df: pd.DataFrame, model, q_scaler):
                     np.array(q_buf[-ENC_LEN:], dtype=np.float32),
                     p_fore_padded,
                 )
-
                 with torch.no_grad():
                     out = model(enc_t, dec_t).squeeze(0).numpy()
 
@@ -1093,169 +1299,19 @@ def page_monthly(df: pd.DataFrame, model, q_scaler):
                     p_buf.append(float(p_fore_step[j] if j < len(p_fore_step) else p_fore_step[-1]))
                     q_buf.append(float(out_orig[j, 1]))
 
-        # ---------------------------------------------------------------
-        # Chart
-        # ---------------------------------------------------------------
-        from plotly.subplots import make_subplots as _msp2
         date_strs = [d.strftime("%Y-%m-%d") for d in all_dates]
-
-        fig = _msp2(
-            rows=2, cols=1,
-            shared_xaxes=True,
-            row_heights=[0.25, 0.75],
-            vertical_spacing=0.05,
-            subplot_titles=(
-                "Curah Hujan P_DAS (mm)",
-                "Prediksi Inflow Q (m³/s) — 30 Hari",
-            ),
+        st.session_state[_fc30_key] = dict(
+            date_strs=date_strs, p_fore_all=p_fore_all,
+            all_q10=all_q10, all_q50=all_q50, all_q90=all_q90,
+            actual_q=actual_q,
         )
 
-        # Curah hujan
-        fig.add_trace(go.Bar(
-            x=date_strs, y=p_fore_all.tolist(),
-            name="P_DAS (mm)",
-            marker_color="#4C9BE8",
-            marker_line_color="#1a6bbf",
-            marker_line_width=0.8,
-        ), row=1, col=1)
-
-        # Band Q10–Q90
-        fig.add_trace(go.Scatter(
-            x=date_strs + date_strs[::-1],
-            y=all_q90 + all_q10[::-1],
-            fill="toself",
-            fillcolor="rgba(255,165,0,0.15)",
-            line=dict(color="rgba(0,0,0,0)"),
-            name="Interval Q10–Q90",
-            hoverinfo="skip",
-        ), row=2, col=1)
-
-        # Q90
-        fig.add_trace(go.Scatter(
-            x=date_strs, y=all_q90,
-            mode="lines", name="Q90 — Basah",
-            line=dict(color="#1565C0", width=2, dash="dash"),
-        ), row=2, col=1)
-
-        # Q50
-        fig.add_trace(go.Scatter(
-            x=date_strs, y=all_q50,
-            mode="lines+markers", name="Q50 — Normal",
-            line=dict(color="#2E7D32", width=3),
-            marker=dict(size=6, color="#2E7D32",
-                        line=dict(color="white", width=1)),
-        ), row=2, col=1)
-
-        # Q10
-        fig.add_trace(go.Scatter(
-            x=date_strs, y=all_q10,
-            mode="lines", name="Q10 — Kering",
-            line=dict(color="#B71C1C", width=2, dash="dot"),
-        ), row=2, col=1)
-
-        # Aktual (jika ada dalam dataset)
-        has_act = any(v is not None for v in actual_q)
-        if has_act:
-            fig.add_trace(go.Scatter(
-                x=date_strs,
-                y=[v if v is not None else None for v in actual_q],
-                mode="lines+markers", name="Aktual (observed)",
-                line=dict(color="#000000", width=2.5),
-                marker=dict(size=7, symbol="circle-open",
-                            color="#000000", line=dict(width=2)),
-            ), row=2, col=1)
-
-        # Garis batas minimum turbin
-        Q_MIN = 0.30 * 60.5
-        fig.add_hline(
-            y=Q_MIN, line_dash="dot", line_color="gray",
-            annotation_text=f"Q_min 1 unit = {Q_MIN:.1f} m³/s",
-            annotation_position="top right",
-            row=2, col=1,
-        )
-
-        fig.update_layout(
-            title=dict(
-                text=f"Prediksi Inflow 30 Hari — {ref_date.strftime('%d %B %Y')} s.d. {end_date.strftime('%d %B %Y')}",
-                font=dict(size=15),
-            ),
-            height=580,
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            legend=dict(
-                orientation="h",
-                yanchor="bottom", y=-0.20,
-                xanchor="center", x=0.5,
-                bgcolor="rgba(255,255,255,0.9)",
-                bordercolor="#cccccc", borderwidth=1,
-                font=dict(size=12),
-            ),
-            margin=dict(l=10, r=10, t=60, b=10),
-        )
-        fig.update_yaxes(title_text="P_DAS (mm)", gridcolor="#eeeeee", row=1, col=1)
-        fig.update_yaxes(title_text="Q (m³/s)", rangemode="tozero",
-                         gridcolor="#eeeeee", row=2, col=1)
-        fig.update_xaxes(showgrid=False, tickformat="%d %b", tickangle=-30, row=2, col=1)
-
-        st.plotly_chart(fig, use_container_width=True)
-
-        # ---------------------------------------------------------------
-        # Metrics
-        # ---------------------------------------------------------------
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Rata-rata Q50", f"{np.mean(all_q50):.3f} m³/s")
-        c2.metric("Q50 Maksimum", f"{max(all_q50):.2f} m³/s",
-                  help=f"Hari ke-{all_q50.index(max(all_q50))+1} ({date_strs[all_q50.index(max(all_q50))]})")
-        c3.metric("Q50 Minimum",  f"{min(all_q50):.3f} m³/s")
-        days_op = sum(1 for q in all_q50 if q >= Q_MIN)
-        c4.metric("Hari bisa operasi turbin", f"{days_op} / 30 hari",
-                  help=f"Q >= {Q_MIN:.1f} m³/s (min 1 unit)")
-
-        # MAE jika ada aktual
-        if has_act:
-            obs = np.array([v for v in actual_q if v is not None])
-            pred_q50_match = np.array([all_q50[i] for i, v in enumerate(actual_q) if v is not None])
-            mae  = np.mean(np.abs(obs - pred_q50_match))
-            rmse = np.sqrt(np.mean((obs - pred_q50_match)**2))
-            st.info(f"Vs Aktual — MAE: **{mae:.3f} m³/s** | RMSE: **{rmse:.3f} m³/s**")
-
-        # ---------------------------------------------------------------
-        # Tabel lengkap
-        # ---------------------------------------------------------------
-        with st.expander("Tabel Prediksi Lengkap (30 hari)", expanded=False):
-            tbl = pd.DataFrame({
-                "Tanggal":             date_strs,
-                "P_DAS (mm)":          p_fore_all.round(1),
-                "Q10 — Kering (m³/s)": np.round(all_q10, 4),
-                "Q50 — Normal (m³/s)": np.round(all_q50, 4),
-                "Q90 — Basah (m³/s)":  np.round(all_q90, 4),
-                "Aktual (m³/s)":       [f"{v:.3f}" if v is not None else "—"
-                                        for v in actual_q],
-            })
-            st.dataframe(tbl, use_container_width=True, hide_index=True)
-
-            csv = tbl.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download CSV",
-                data=csv,
-                file_name=f"forecast_30hari_{ref_date.strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-            )
-
-        st.caption(
-            "Prediksi rolling: akurasi tertinggi di 7 hari pertama, "
-            "menurun di hari 8–30 karena prediksi sebelumnya dipakai sebagai look-back."
-        )
-
-        # ---------------------------------------------------------------
-        # Turbine performance — 30 hari
-        # ---------------------------------------------------------------
-        st.divider()
-        st.subheader("Performa Turbin — 30 Hari")
-        render_turbine_section(
-            date_strs,
-            q10=all_q10, q50=all_q50, q90=all_q90,
-            label="(30 Hari ke Depan)",
+    if _fc30_key in st.session_state:
+        s = st.session_state[_fc30_key]
+        _show_monthly_results(
+            s["date_strs"], s["p_fore_all"],
+            s["all_q10"], s["all_q50"], s["all_q90"],
+            s["actual_q"], ref_date, end_date,
         )
 
 
@@ -1371,10 +1427,11 @@ def page_analysis(model, q_scaler):
     # ---------------------------------------------------------------
     # Section B — Turbine performance charts (4, 5, 6)
     # ---------------------------------------------------------------
-    st.subheader("B. Turbine Performance — PLTA Grindulu 1000 MW")
+    st.subheader("B. Turbine Performance — PLTA Grindulu Pumped Storage 1000 MW")
     st.caption(
-        "Francis Reversible Pumped | H_net = 486.5 m | "
-        "Q_design = 60.5 m³/s/unit | 4 units | ηT = 0.90 | ηG = 0.96"
+        "Francis Reversible Pumped Storage | OPSI-1A | H_net = 486.5 m | "
+        "Q_turbine = 60.5 m³/s/unit × 4 unit = 242 m³/s | P_rated = 1000 MW | "
+        "Upper reservoir 7.90 juta m³ | Generasi 8 jam/hari (peak)"
     )
 
     with st.expander("Chart 4 — Turbine Efficiency vs Flow Rate", expanded=True):
@@ -1410,13 +1467,11 @@ def main():
 
     render_sidebar(df)
 
-    # To restore Simulasi Tahunan: uncomment the 3 lines marked [ANNUAL]
-    # and change tab1,tab2,tab3,tab4 → tab1,tab2,tab3,tab4,tab5
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📈 Historical Data",
         "🔮 7-Day Forecast",
         "📆 30-Day Forecast",
-        # "📅 Simulasi Tahunan",  # [ANNUAL]
+        "📅 Simulasi Tahunan",
         "📊 Analysis & Turbine Performance",
     ])
     with tab1:
@@ -1425,8 +1480,9 @@ def main():
         page_forecast(df, model, q_scaler)
     with tab3:
         page_monthly(df, model, q_scaler)
-    # with tab4: page_annual(df)  # [ANNUAL]
-    with tab4:  # change to tab5 when restoring [ANNUAL]
+    with tab4:
+        page_annual(df)
+    with tab5:
         page_analysis(model, q_scaler)
 
 

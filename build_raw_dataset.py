@@ -45,10 +45,10 @@ PDF_STATIONS = {
 # Composite CN = 0.0272*55 + 0.1733*78 + 0.4069*72 + 0.3926*90 = 79.644 → 80
 # ---------------------------------------------------------------------------
 
-CN      = 80.0
-S       = (25400 / CN) - 254   # 63.5 mm
-Ia      = 0.2 * S              # 12.7 mm  (initial abstraction)
-DAS_KM2 = 700.0                # km²  catchment area
+CN      = 76.46
+S       = (25400 / CN) - 254   # 78.1998 mm
+Ia      = 0.2 * S              # 15.64 mm  (initial abstraction)
+DAS_KM2 = 127.86               # km²  catchment area (luas efektif DAS, HUJAN WILAYAH DAS sheet)
 
 # ---------------------------------------------------------------------------
 # Dynamic baseflow — linear reservoir routing
@@ -67,8 +67,19 @@ DAS_KM2 = 700.0                # km²  catchment area
 
 K_RECESSION   = 0.92     # groundwater recession coefficient
 ALPHA_RECHARGE = 0.15    # fraction of Q_runoff recharging groundwater
-Q_BASE_MIN    = 3.92918  # m³/s  minimum baseflow (physical lower bound)
-Q_BASE_INIT   = 3.92918  # m³/s  initial condition (2014-01-01)
+Q_BASE_MIN    = 1.02111226  # m³/s  minimum baseflow (dari PERHITUNGAN_v2.xlsx)
+Q_BASE_INIT   = 1.02111226  # m³/s  initial condition (2014-01-01)
+
+# Bobot Thiessen (dari LUAS DAERAH sheet — Wi = Ai / A_total, total = 754.24 km²)
+# Urutan sesuai PDF_STATIONS: pacitan, nawangan, kebonagung, bandar, tegalombo, tulakan
+THIESSEN_WEIGHTS = {
+    "pacitan":    77.11  / 754.24,
+    "nawangan":   124.06 / 754.24,
+    "kebonagung": 124.85 / 754.24,
+    "bandar":     117.34 / 754.24,
+    "tegalombo":  149.26 / 754.24,
+    "tulakan":    161.62 / 754.24,
+}
 
 # ---------------------------------------------------------------------------
 # Month-name → month-number map (handles both BBWS and Hidrologi formats)
@@ -271,9 +282,10 @@ def main():
     df.index.name = "date"
     df = df.reset_index()
 
-    # P_DAS = simple mean of 6 stations
-    # (confirmed from XLSX comment: "PDAS = jumlah hujan tiap pos / jumlah pos")
-    df["p_das"] = df[list(PDF_STATIONS.keys())].mean(axis=1)
+    # P_DAS = Thiessen weighted average (bobot dari LUAS DAERAH sheet)
+    df["p_das"] = sum(
+        df[st] * w for st, w in THIESSEN_WEIGHTS.items()
+    )
 
     # --- Hydrology pipeline ---
     df["pe"]         = scs_runoff_mm(df["p_das"]).values
