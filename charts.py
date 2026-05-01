@@ -11,17 +11,18 @@ Group B — Turbine performance charts (PLTA specs, no model needed):
     chart_fixed_vs_variable_speed(...) Chart 5
     chart_power_output(...)            Chart 6
 
-PLTA Grindulu Specs
--------------------
-Gross head      : 500 m
-Net head        : 486.5 m
-Design flow/unit: 60.5 m³/s
-Units           : 4
+PLTA Grindulu PS Specs — OPSI-2A
+----------------------------------
+Net head        : 500 m
+Design flow/unit: 59.0 m³/s
+Units           : 4  (total 236 m³/s)
 Turbine η       : 0.90
 Generator η     : 0.96
-Rated power/unit: 250 MW
+Rated power/unit: 250 MW  (total 1000 MW)
 Turbine type    : Francis reversible pumped
 Speed           : 500 RPM  (variable speed range 450–550 RPM)
+Upper reservoir : 5.42 juta m³
+Lower reservoir : 6.51 juta m³
 """
 
 import numpy as np
@@ -32,9 +33,9 @@ from plotly.subplots import make_subplots
 # PLTA constants
 # ---------------------------------------------------------------------------
 
-H_NET        = 486.5          # m  net head
+H_NET        = 500.0          # m  net head (OPSI-2A)
 H_GROSS      = 500.0          # m  gross head
-Q_DESIGN     = 60.5           # m³/s  per unit
+Q_DESIGN     = 59.0           # m³/s  per unit (OPSI-2A)
 N_UNITS      = 4
 ETA_T        = 0.90           # turbine efficiency at design point
 ETA_G        = 0.96           # generator efficiency
@@ -164,7 +165,7 @@ def chart_quantile_prediction(
         hoverinfo="skip",
     ))
     fig.add_trace(go.Scatter(
-        x=x, y=pred_q90, name="Q90 (Wet)",
+        x=x, y=pred_q90, name="Q10 (Basah)",
         mode="lines", line=dict(color="#1f77b4", dash="dot", width=1.2),
     ))
     fig.add_trace(go.Scatter(
@@ -172,7 +173,7 @@ def chart_quantile_prediction(
         mode="lines", line=dict(color="#d62728", width=2),
     ))
     fig.add_trace(go.Scatter(
-        x=x, y=pred_q10, name="Q10 (Dry)",
+        x=x, y=pred_q10, name="Q90 (Kering)",
         mode="lines", line=dict(color="#ff7f0e", dash="dot", width=1.2),
     ))
     fig.add_trace(go.Scatter(
@@ -438,7 +439,7 @@ def chart_probabilistic_forecast(
 
     # Q90 border (light)
     fig.add_trace(go.Scatter(
-        x=x, y=pred_q90, name="Q90 (Upper)",
+        x=x, y=pred_q90, name="Q10 — Basah",
         mode="lines",
         line=dict(color="rgba(100,130,220,0.6)", width=1),
         showlegend=False,
@@ -446,7 +447,7 @@ def chart_probabilistic_forecast(
 
     # Q10 border (light)
     fig.add_trace(go.Scatter(
-        x=x, y=pred_q10, name="Q10 (Lower)",
+        x=x, y=pred_q10, name="Q90 — Kering",
         mode="lines",
         line=dict(color="rgba(100,130,220,0.6)", width=1),
         showlegend=False,
@@ -512,7 +513,7 @@ def chart_all_quantiles(
         line=dict(color="#2ca02c", width=2),
     ))
     fig.add_trace(go.Scatter(
-        x=x, y=pred_q90, name="Q90 — Wet",
+        x=x, y=pred_q90, name="Q10 — Basah",
         mode="lines",
         line=dict(color="#1565C0", width=1.5, dash="dash"),
     ))
@@ -522,7 +523,7 @@ def chart_all_quantiles(
         line=dict(color="#d62728", width=2),
     ))
     fig.add_trace(go.Scatter(
-        x=x, y=pred_q10, name="Q10 — Dry",
+        x=x, y=pred_q10, name="Q90 — Kering",
         mode="lines",
         line=dict(color="#ff7f0e", width=1.5, dash="dot"),
     ))

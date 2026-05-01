@@ -108,16 +108,16 @@ N_UNITS       = 4
 ETA_T_MAX     = 0.90        # max turbine efficiency
 ETA_G         = 0.96        # generator efficiency
 ETA_PUMP      = 0.85        # pump mode efficiency
-VOL_UPPER_MAX = 7_900_000   # m³  upper reservoir (7.90 juta m³)
-VOL_LOWER_MAX = 8_990_000   # m³  lower reservoir (8.99 juta m³)
-Q_TURBINE     = 242         # m³/s total (4 × 60.5)
+VOL_UPPER_MAX = 5_420_000   # m³  upper reservoir (5.42 juta m³)
+VOL_LOWER_MAX = 6_510_000   # m³  lower reservoir (6.51 juta m³)
+Q_TURBINE     = 236         # m³/s total (4 × 59.0)
 P_RATED_MW    = 1000        # MW total rated power
-HOURS_GEN     = 8           # h/day peak generation
-HOURS_PUMP    = 16          # h/day off-peak pumping
+HOURS_GEN     = 4           # h/day peak generation
+HOURS_PUMP    = 20          # h/day off-peak pumping
 ETA_LOSS_FRAC = 0.03        # 3% reservoir losses per cycle
 ```
 
-Daily operation cycle: Night pump (16h, lower→upper) → Day generation (8h peak, upper→lower) → River inflow (adds to lower) → Losses (3% of generated volume).
+Daily operation cycle: Off-peak pump (20h, lower→upper) → Peak generation (4h, upper→lower) → River inflow (adds to lower) → Losses (3% of generated volume).
 
 River inflow (q_total from model) supplements the lower reservoir — the system is water-recycling, not run-of-river. Average inflow ~1.65 m³/s; design flow 242 m³/s comes from pumped storage cycling.
 
